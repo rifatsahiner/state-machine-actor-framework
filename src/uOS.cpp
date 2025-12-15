@@ -2,24 +2,119 @@
 #include <iterator>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <csignal>
+
+#include <cli/cli.h>
+#include <cli/standaloneasioscheduler.h>
+#include <cli/standaloneasioremotecli.h>
+
+#include <nlohmann/json.hpp>
 
 #include "uOS.h"
 
-// #define ASSERT_ON_EXTRA_COPY(event_ptr, target_use_count) assert(event_ptr.use_count() == target_use_count)
 using namespace std::chrono_literals;
 
 
 namespace uOS {
 
 
-void FW::init(int argc, char* argv[]){
+// required for forward decleration
+std::unique_ptr<cli::Cli> FW::_cli;
+std::unique_ptr<cli::StandaloneAsioScheduler> FW::_cliScheduler;
+std::unique_ptr<cli::StandaloneAsioCliTelnetServer> FW::_cliServer;
+std::unordered_map<std::string, cli::CmdHandler> FW::_menuHandlerMap;
+
+void FW::init(int argc, char* argv[], const std::string& appName){
+    bool tui = true;
+    bool cli = true;
+    int cliPort = 42069; // default CLI port
+
     // init usage lists
     _taskIdUsageList.fill(false);
     _timerIdUsageList.fill(false);
+    _taskMap.clear();
+    _subsMap.clear();
+    
+    _isRunning = true;
 
-    // init logger if activated
-    if(argc != 0){
-        Logger::init(argc, argv, &FW::kill);
+    // parse command line arguments
+    for(int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if(arg == "--no-tui") {
+            tui = false;
+        } else if(arg == "--no-cli") {
+            cli = false;
+        } else if(arg == "--cli-port" && (i+1) < argc) {
+            try {
+                size_t pos;
+                std::string port_str = argv[i+1];
+                int port = std::stoi(port_str, &pos);
+                if (pos == port_str.length() && port > 0 && port <= 65535) {
+                    cliPort = port;
+                    i++; // skip next argument as it is the port number
+                }
+            } catch (...) { }
+        }
+    }
+
+    // set interrupt signal handlers
+    if (tui == false) std::signal(SIGINT, _sigintHandler); // set if TUI is not active
+    std::signal(SIGTERM, _sigintHandler);
+    std::signal(SIGHUP, _sigintHandler);
+    std::signal(SIGQUIT, _sigintHandler);
+
+    // init logger
+    if(tui){
+        Logger::init(argc, argv, &FW::kill);    // todo: can set tui name with appName?
+    } else {
+        Logger::init(argc, argv);
+    }
+
+    // init cli if activated
+    if(cli){
+        // setup cli
+        // prepare root manu
+        auto rootMenu = std::make_unique<cli::Menu>(appName);
+        auto fwMenu = std::make_unique<cli::Menu>("Framework");
+        fwMenu->Insert("list-tasks", &FW::_cliListAllTasks, "List current tasks");
+        fwMenu->Insert("search-task", &FW::_cliListTasksWithSearch, "Search task name with given string (case sensitive)");
+        fwMenu->Insert("post-sig", &FW::_cliPostSignal, "post a signal only event to a task <signalId> <targetTaskId>");
+        fwMenu->Insert("post-sig-src", &FW::_cliPostSignalWithSource, "post a signal only event to a task with source task info <signalId> <targetTaskId> <sourceTaskId>");
+        fwMenu->Insert("pub-sig", &FW::_cliPublishSignal, "publish a signal only event <signalId>");
+        fwMenu->Insert("pub-sig-src", &FW::_cliPublishSignalWithSource, "publish a signal only event with source task info <signalId> <sourceTaskId>");
+        fwMenu->Insert("post-evt", &FW::_cliPostEvent, "post an event to a task with parameters <signalId> <parameterJsonPath> <targetTaskId>");
+        fwMenu->Insert("post-evt-src", &FW::_cliPostEventWithSource, "post an event to a task with parameters and source task info <signalId> <parameterJsonPath> <targetTaskId> <sourceTaskId>");
+        fwMenu->Insert("pub-evt", &FW::_cliPublishEvent, "publish an event with parameters <signalId> <parameterJsonPath>");
+        fwMenu->Insert("pub-evt-src", &FW::_cliPublishEventWithSource, "publish an event with parameters and source task info <signalId> <parameterJsonPath> <sourceTaskId>");
+        rootMenu->Insert(std::move(fwMenu));
+
+        // create cli object and assing wrong command handler to avoid cli using console
+        _cliRootMenu = rootMenu.get();
+        _cli = std::make_unique<cli::Cli>(std::move(rootMenu));
+        _cli->WrongCommandHandler( [](std::ostream& out, const std::string& cmd) {
+            (void)out;
+            LOG(uOS::LogLevel::LOG_WARNING, "Unknown CLI command or incorrect parameters: {}", cmd);
+        } );
+
+        // create scheduler and telnet server
+        _cliScheduler = std::make_unique<cli::StandaloneAsioScheduler>();
+    
+        try {
+            _cliServer = std::make_unique<cli::StandaloneAsioCliTelnetServer>(*_cli, *_cliScheduler, cliPort);
+            _cliServer->ExitAction( [](auto& out) { out << "Closing CLI connection...\n"; } );
+            LOG(uOS::LogLevel::LOG_INFO, "CLI started on port: {}", cliPort);
+        } catch (const std::system_error& e) {
+            // Handle binding failure (e.g., port in use)
+            LOG(uOS::LogLevel::LOG_ERROR, "Failed to start CLI server on port {}: {}", cliPort, e.what());
+            _cliServer.reset();  // Ensure it's null if failed
+        } catch (const std::exception& e) {
+            // Catch any other unexpected exceptions
+            LOG(uOS::LogLevel::LOG_ERROR, "Unexpected error starting CLI server: {}", e.what());
+            _cliServer.reset();
+        }
+    } else {
+        _cli.reset();
     }
 
     // lock memory so we're never swapped out to disk   ????
@@ -49,7 +144,8 @@ int32_t FW::run() {
 
     // start logger
     Logger::start();
-    LOG(uOS::LogLevel::LOG_INFO, "[SYSTEM] Welcome to uOS application...");
+    LOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
+    LOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
 
     while(_isRunning) {
         // now süresini al
@@ -57,20 +153,17 @@ int32_t FW::run() {
 
         // check for second
         if(++s == 50) {
-            auto secEvent = std::make_shared<const Event>(TICK_SEC_EVENT);
-            _publishEvent(secEvent);
+            _publishEvent(std::make_shared<const Event>(TICK_SEC_EVENT));
             s = 0;
             
             // check for minute
             if(++m == 60) {
-                auto minEvent = std::make_shared<const Event>(TICK_MIN_EVENT);
-                _publishEvent(minEvent);
+                _publishEvent(std::make_shared<const Event>(TICK_MIN_EVENT));
                 m = 0;
 
                 // check for hour
                 if(++h == 60) {
-                    auto hourEvent = std::make_shared<const Event>(TICK_HOUR_EVENT);
-                    _publishEvent(hourEvent);
+                    _publishEvent(std::make_shared<const Event>(TICK_HOUR_EVENT));
                     h = 0;
                 }
             }
@@ -79,20 +172,33 @@ int32_t FW::run() {
         // handle timers
         _handleTick();
 
+        // handle cli
+        if(_cli){
+            _cliScheduler->PollOne();
+        }
+
+        // handle self stop and self delete request from tasks
+        _handleStopDelete();
+
         // sleep_until now + 20ms
         std::this_thread::sleep_until(now + 20ms);
     }
 
     // terminate all task threads
-    // todo: buraya tüm task threadleri kapatacak bir kod eklenecek
-    //stopTask(_taskMap.begin()->first);
-    for(auto it = _taskMap.begin(); it != _taskMap.end();) {
-        stopTask(it->first);
-        it = _taskMap.erase(it);
+    LOG(uOS::LogLevel::LOG_INFO, "FW run loop exit. Stopping all tasks");
+    std::shared_lock readlock(_taskMutex);
+    for(const auto& taskPair : _taskMap) {
+        taskPair.second->stop(true);
     }
+    readlock.unlock();
+
+    // clear task map
+    std::unique_lock writeLock(_taskMutex);
+    _taskMap.clear();
+    writeLock.unlock();
 
     // terminate logger
-    LOG(LogLevel::LOG_INFO, "[SYSTEM] uOS Bye bye!");
+    LOG(LogLevel::LOG_INFO, "uOS Bye bye!");
     Logger::stop();
 
     // onCleanup aşağıdaki satırlar
@@ -105,78 +211,155 @@ int32_t FW::run() {
 }
 
 void FW::kill(void){
+    LOG(LogLevel::LOG_INFO, "Stopping FW");
     _isRunning = false;
 }
 
-void FW::startTask(TaskId taskId){
+void FW::startTask(TaskId taskId){ 
+    std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
     assert(taskIter != _taskMap.cend());
 
+    LOG(LogLevel::LOG_INFO, "Starting task with id: {}", taskId);
     taskIter->second->start();
 }
 
-void FW::stopTask(TaskId taskId){
+void FW::stopTask(TaskId taskId, bool waitShutdown){
+    std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
     assert(taskIter != _taskMap.cend());
 
-    taskIter->second->stop();
+    LOG(LogLevel::LOG_INFO, "Stoping task with id: {}", taskId);
+    taskIter->second->stop(waitShutdown);
 }
 
-void FW::postEvent(TaskId taskId, const Event* event){
+std::string_view FW::getTaskState(TaskId taskId){
+    std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
     assert(taskIter != _taskMap.cend());
 
-    std::shared_ptr<const Event> eventSp(event);
-    event = nullptr;
-
-    //taskIter->second->putEvent(std::move(const_cast< std::shared_ptr<Event>& >(event)));
-    taskIter->second->putEvent(std::move(eventSp));
+    return taskIter->second->getState();
 }
 
-TimerId FW::postEventIn(uint_fast16_t intervalMs, TaskId taskId, const Event* event)
-{
+bool FW::isTaskIdle(TaskId taskId){
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(taskId);
+    assert(taskIter != _taskMap.cend());
+#ifndef NDEBUG
+    return taskIter->second->isIdle();
+#else
+    return true;
+#endif
+}
+
+void FW::resumeTask(TaskId taskId, bool cleanStart){
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(taskId);
+    assert(taskIter != _taskMap.cend());
+
+    LOG(LogLevel::LOG_INFO, "Resuming task with id: {}", taskId);
+    taskIter->second->resume(cleanStart);
+}
+
+void FW::deleteTask(TaskId taskId){
+    LOG(LogLevel::LOG_INFO, "Deleting task with id: {}", taskId);
+    
+    // stop task 
+    stopTask(taskId, true);
+    
+    {
+        std::lock_guard taskLock(_taskMutex);
+        auto taskIter = _taskMap.find(taskId);
+        assert(taskIter != _taskMap.cend());
+        
+        // get task name before deletion
+        std::string taskName = taskIter->second->getName();
+
+        // delete from map and make its taskId available
+        assert(_taskMap.erase(taskId) == 1);
+        _taskIdUsageList[taskId] = false;
+
+        // remove its cli menu if necessary
+        if(_cli){
+            // check if it was last task of its kind
+            if(std::ranges::none_of(_taskMap, [name = std::string_view(taskName)](const auto& pair) { return pair.second->getName() == name; })){
+                // post to cli scheduler for thread safety
+                _cliScheduler->Post([taskName = std::move(taskName)]() {
+                    // if there is a menu for this task, remove it
+                    auto it = _menuHandlerMap.find(taskName);
+                    if(it != _menuHandlerMap.end()) {
+                        it->second.Remove();
+                        _menuHandlerMap.erase(it);
+                        LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is removed", taskName);
+                    }
+                });
+            }
+        }
+    }    
+
+    // clear its subscriptions
+    auto checkSubsId = [taskId](TaskId subsId){ return subsId == taskId; };
+    std::lock_guard<std::mutex> subsLock(_subsMutex);
+    for(auto& pair : _subsMap) {
+        auto& subsList = pair.second;
+        auto it = std::find_if(subsList.begin(), subsList.end(), checkSubsId);
+        if(it != subsList.end()){
+            subsList.erase(it);
+        }
+    }
+}
+
+void FW::postEvent(TaskId taskId, std::shared_ptr<const Event> event){
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(taskId);
+    assert(taskIter != _taskMap.cend());
+
+    taskIter->second->putEvent(std::move(event));
+}
+
+TimerId FW::postEventIn(uint_fast16_t intervalMs, TaskId taskId, std::shared_ptr<const Event> event) {
+    std::shared_lock lock(_taskMutex);
     assert(_taskMap.find(taskId) != _taskMap.cend());
+    lock.unlock();
     
     // call common function for new timer creation
-    return _setupTimedEvent(false, false, intervalMs / 20, event, taskId);
+    return _setupTimedEvent(false, false, intervalMs / 20, std::move(event), taskId);
 }
 
-TimerId FW::postEventEvery(uint_fast16_t intervalMs, TaskId taskId, const Event* event)
-{
+TimerId FW::postEventEvery(uint_fast16_t intervalMs, TaskId taskId, std::shared_ptr<const Event> event) {
+    std::shared_lock lock(_taskMutex);
     assert(_taskMap.find(taskId) != _taskMap.cend());
+    lock.unlock();
 
-    return _setupTimedEvent(false, true, intervalMs / 20, event, taskId);
+    return _setupTimedEvent(false, true, intervalMs / 20, std::move(event), taskId);
 }
 
-void FW::publishEvent(const Event* event)
+void FW::publishEvent(std::shared_ptr<const Event> event)
 {
     std::lock_guard<std::mutex> lock(_subsMutex);
 
-    // get signal's subs list, assert if signal id does not have subs list 
+    // get signal's subs list, return if signal id does not have subs list 
     auto subListIter = _subsMap.find(event->signal);
-    //assert(subListIter != _subsMap.cend()); -> publish eden bunu bilmeyebilir
-    // todo: sinyalin subs ları yoksa return edilmesi gerekiyor
-
-    std::shared_ptr<const Event> eventSp(event);
-    event = nullptr;
-
-    _publishEventCommon(eventSp, subListIter->second);
+    
+    if(subListIter != _subsMap.cend()){
+        _publishEventCommon(std::move(event), subListIter->second);
+    }
 }
 
-TimerId FW::publishEventIn(uint_fast16_t intervalMs, const Event* event)
+TimerId FW::publishEventIn(uint_fast16_t intervalMs, std::shared_ptr<const Event> event)
 {
-    return _setupTimedEvent(true, false, intervalMs / 20, event);
+    return _setupTimedEvent(true, false, intervalMs / 20, std::move(event));
 }
 
-TimerId FW::publishEventEvery(uint_fast16_t intervalMs, const Event* event)
+TimerId FW::publishEventEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event> event)
 {
-    return _setupTimedEvent(true, true, intervalMs / 20, event);
+    return _setupTimedEvent(true, true, intervalMs / 20, std::move(event));
 }
 
 void FW::cancelTimedEvent(TimerId timerId){
     std::lock_guard<std::mutex> lock(_timerMutex);
 
-    // check if timer id is valid
+    // check if timer id is still present
     if(_timerStorageMap.find(timerId) != _timerStorageMap.cend())
     {
         auto itPrev = _timerQueue.cbefore_begin();
@@ -201,16 +384,14 @@ void FW::cancelTimedEvent(TimerId timerId){
             else
                 itPrev = itCancel;    
         }
-        
+
         assert(false);
     }
-
-    assert(false);
 }
 
 void FW::subscribe(SignalId signalId, TaskId subsId)
 {
-    // assert -- user-signal-start < signalId < signal-list-count
+    // todo: assert -- user-signal-start < signalId < signal-list-count
     std::lock_guard<std::mutex> lock(_subsMutex);
 
     auto signalSubsListIter = _subsMap.find(signalId);
@@ -233,8 +414,15 @@ void FW::subscribe(SignalId signalId, TaskId subsId)
         subsList.push_back(subsId);
     }
 
-    //std::cout << "Task Id: " << unsigned(subsId) << "subscribed to Signal Id: " << signalId << std::endl;
     LOG(LogLevel::LOG_INFO, "Task Id: {} subscribed to signalId: {}", subsId, signalId);
+}
+
+void FW::subscribe(std::initializer_list<SignalId> signalList, TaskId subsId)
+{
+    // iterate over initializer list and call subscribe for each signal
+    for(SignalId signalId : signalList) {
+        subscribe(signalId, subsId);
+    }
 }
 
 void FW::unsubscribe(SignalId signalId, TaskId subsId)
@@ -252,17 +440,63 @@ void FW::unsubscribe(SignalId signalId, TaskId subsId)
 
     // remove subsId from list
     subsList.erase(subsIdIter);
-    //std::cout << "taskId " << unsigned(*subsIdIter) << " unsubscibed from signalId " << signalId << std::endl;
+    
     LOG(LogLevel::LOG_INFO, "Task Id: {} unsubscribed to signalId: {}", subsId, signalId);
 
     //todo: sinyalde subs kalmadıysa map'den sil
+}
+
+void FW::unsubscribe(std::initializer_list<SignalId> signalList, TaskId subsId)
+{
+    // iterate over initializer list and call unsubscribe for each signal
+    for(SignalId signalId : signalList) {
+        unsubscribe(signalId, subsId);
+    }
+}
+
+void FW::stop(TaskId taskId) {
+    // add to stop list
+    std::lock_guard<std::mutex> lock(_listMutex);
+    _stopList.push_back(taskId);
+    LOG(LogLevel::LOG_INFO, "Self stop is schduled for task id: {}", taskId);
+}
+
+void FW::delete_(TaskId taskId) {
+    // add to delete list
+    std::lock_guard<std::mutex> lock(_listMutex);
+    _deleteList.push_back(taskId);
+    LOG(LogLevel::LOG_INFO, "Self delete is schduled for task id: {}", taskId);
+}
+
+void FW::registerCliMenu(TaskId taskId, std::unique_ptr<cli::Menu>&& menuPtr) {
+    // check if cli is initialized
+    if (_cli) {
+        // get task name
+        std::shared_lock lock(_taskMutex);
+        std::string taskName = _taskMap[taskId]->getName();
+
+        // post to cli scheduler for thread safety
+        auto copyableMenuPtrPtr = std::make_shared<std::unique_ptr<cli::Menu>>(std::move(menuPtr));        // this is needed to keep lambda copy constructable
+        _cliScheduler->Post([taskName = std::move(taskName), copyableMenuPtrPtr]() {
+            // check if this task had already inserted menu
+            if(_menuHandlerMap.find(taskName) == _menuHandlerMap.end()){
+                // insert menu and save menu handler
+                _menuHandlerMap[taskName] = _cliRootMenu->Insert(std::move(*copyableMenuPtrPtr));
+                LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is registered", taskName);
+            } else {
+                LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is already registered", taskName);
+            }
+        });
+    } else {
+        LOG(LogLevel::LOG_WARNING, "CLI scheduler is not initialized. Cannot register CLI menu for task id: {}", taskId);
+    }
 }
 
 //////////////////////////////////////////////////////
 //                                                  //
 //////////////////////////////////////////////////////
 
-void FW::_publishEvent(std::shared_ptr<const Event>& event)
+void FW::_publishEvent(std::shared_ptr<const Event>&& event)
 {
     std::lock_guard<std::mutex> lock(_subsMutex);
 
@@ -270,19 +504,28 @@ void FW::_publishEvent(std::shared_ptr<const Event>& event)
     auto subListIter = _subsMap.find(event->signal);
 
     if(subListIter != _subsMap.cend()) {
-        _publishEventCommon(event, subListIter->second);
+        _publishEventCommon(std::move(event), subListIter->second);
     }
 }
 
-void FW::_publishEventCommon(std::shared_ptr<const Event>& event, std::vector<TaskId>& subsList)
+void FW::_publishEventCommon(std::shared_ptr<const Event>&& event, std::vector<TaskId>& subsList)
 {
+    std::shared_lock lock(_taskMutex);
+
     // for each subs, send a copy of the event (send original event to last subs)
     for(TaskId taskId : subsList){
-        if(taskId != subsList.back()){
-            std::shared_ptr<const Event> eventCopy = event;
-            _taskMap.find(taskId)->second->putEvent(std::move(eventCopy));
-        } else 
-            _taskMap.find(taskId)->second->putEvent(std::move(event));
+        auto it = _taskMap.find(taskId);
+        if(it != _taskMap.cend()){
+            if(taskId != subsList.back()){
+                std::shared_ptr<const Event> eventCopy = event;
+                it->second->putEvent(std::move(eventCopy));
+            } else {
+                it->second->putEvent(std::move(event));
+            }
+        } else {
+            // if task is not found, log a warning
+            LOG(LogLevel::LOG_WARNING, "Task with id: {} not found on publishing signalId: {}", taskId, event->signal);
+        }
     }
 }
 
@@ -300,11 +543,23 @@ TaskId FW::_getAvailableTaskId(void){
 }
 
 TimerId FW::_getAvailableTimerId(void){
+    static TimerId lastTimerId = 0;
     TimerId i;
     
-    for(i = 0; i < uOS_FW_MAX_TIMER_COUNT; i++){
+    // search for lastTimerId + 1 -> uOS_FW_MAX_TIMER_COUNT
+    for(i = lastTimerId + 1; i < uOS_FW_MAX_TIMER_COUNT; i++){
         if(_timerIdUsageList[i] == false){
             _timerIdUsageList[i] = true;
+            lastTimerId = i;
+            return i;
+        }
+    }
+
+    // if not found search for 0 -> lastTimerId
+    for(i = 0; i < lastTimerId; i++){
+        if(_timerIdUsageList[i] == false){
+            _timerIdUsageList[i] = true;
+            lastTimerId = i;
             return i;
         }
     }
@@ -340,14 +595,9 @@ void FW::_insertTimerQueue(TimerId timerId, uint_fast16_t interval)
         itNext->second = accuNext - interval;
 }
 
-TimerId FW::_setupTimedEvent(bool isPublish, bool isPeriodic, uint_fast16_t interval, const Event* eventPtr, TaskId receiverTaskId)
+TimerId FW::_setupTimedEvent(bool isPublish, bool isPeriodic, uint_fast16_t interval, std::shared_ptr<const Event>&& eventPtr, TaskId receiverTaskId)
 {
-    // create shared pointer to use on remeaining life of event
-    std::shared_ptr<const Event> eventSp(eventPtr);
-    eventPtr = nullptr;
-
-    TimerNode timerNode {isPublish, isPeriodic, receiverTaskId, interval, std::move(eventSp) };
-    //ASSERT_ON_EXTRA_COPY(timerNode.eventPtr, 1);
+    TimerNode timerNode {isPublish, isPeriodic, receiverTaskId, interval, std::move(eventPtr) };
 
     // lock timer related resources
     std::lock_guard<std::mutex> lock(_timerMutex);
@@ -360,7 +610,6 @@ TimerId FW::_setupTimedEvent(bool isPublish, bool isPeriodic, uint_fast16_t inte
 
     // store timer data
     _timerStorageMap.emplace(std::move(timerId), std::move(timerNode));
-    //ASSERT_ON_EXTRA_COPY(_timerStorageMap.find(timerId)->second.eventPtr, 1);
     // todo: assert if emplace fails
 
     //std::cout << "timer created with timer id: " << timerId << std::endl;
@@ -405,24 +654,30 @@ void FW::_handleTick(void)  // todo: inline yap
             LOG(LogLevel::LOG_TRACE, "Timer expired with timerId: {}", timerId); 
 
             // get stored timer node with the timer key
+            // todo: find thread safe değil burası kontrol edilecek
             TimerNode& timerNode = _timerStorageMap.find(timerId)->second;  // find is thread-safe
-            //ASSERT_ON_EXTRA_COPY(timerNode.eventPtr, 1);
 
             // event'i post et
             // todo: event'i move edersem periyodik olarak tekrar çağırıldığında event kaybolmuyor mu?
             if(timerNode.isPublish){
                 if(timerNode.isPeriodic == false)
-                    _publishEvent(timerNode.eventPtr);
+                    _publishEvent(std::move(timerNode.eventPtr));
                 else {
                     std::shared_ptr<const Event> eventCopy = timerNode.eventPtr;
-                    _publishEvent(eventCopy);
+                    _publishEvent(std::move(eventCopy));
                 }
             } else {
-                if(timerNode.isPeriodic == false){
-                    _taskMap.find(timerNode.receiverTaskId)->second->putEvent(std::move(timerNode.eventPtr));
-                }else {
-                    std::shared_ptr<const Event> eventCopy = timerNode.eventPtr;
-                    _taskMap.find(timerNode.receiverTaskId)->second->putEvent(std::move(eventCopy));
+                std::shared_lock taskMapLock(_taskMutex);
+                auto it = _taskMap.find(timerNode.receiverTaskId);
+                if(it != _taskMap.cend()){
+                    if(timerNode.isPeriodic == false){
+                        it->second->putEvent(std::move(timerNode.eventPtr));
+                    } else {
+                        std::shared_ptr<const Event> eventCopy = timerNode.eventPtr;
+                        it->second->putEvent(std::move(eventCopy));
+                    }
+                } else {
+                    LOG(LogLevel::LOG_WARNING, "Timer expired for deleted task with id: {} ", timerNode.receiverTaskId);
                 }
             }
 
@@ -430,13 +685,193 @@ void FW::_handleTick(void)  // todo: inline yap
             // periyodik değilse storage erase yap
             lock.lock();
             if(timerNode.isPeriodic){
-                _insertTimerQueue(timerId, timerNode.interval);
+                _insertTimerQueue(timerId, (timerNode.interval - 1)); // -tam nedenini çözemedim ama 20ms fazla çıkıyor periyodiklerde, o yüzden -1 yaptım
             } else {
                 _timerStorageMap.erase(timerId);
                 _timerIdUsageList[timerId] = false;
             }
             lock.unlock();
         }
+    }
+}
+
+void FW::_handleStopDelete(void)  // todo: inline yap
+{
+    std::lock_guard<std::mutex> lock(_listMutex);
+    
+    if(_stopList.empty() == false){
+        for(TaskId taskId : _stopList){
+            stopTask(taskId);
+        }
+        _stopList.clear();
+    }
+    
+    if(_deleteList.empty() == false){
+        for(TaskId taskId : _deleteList){
+            deleteTask(taskId);
+        }
+        _deleteList.clear();
+    }
+}
+
+void FW::_sigintHandler(int signum){
+    // log the signal type
+    switch (signum) {
+        case SIGINT:    LOG(LogLevel::LOG_WARNING, "SIGINT received, stopping FW"); break;
+        case SIGTERM:   LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW"); break;
+        case SIGHUP:    LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW"); break;
+        case SIGQUIT:   LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW"); break;
+        default:        LOG(LogLevel::LOG_ERROR, "Unknown signal received: {}", signum); break;
+    }
+    
+    // stop the FW
+    kill(); 
+}
+
+void FW::_cliPostSignal(std::ostream& out, int signalId, int targetTaskId) {
+    if(static_cast<SignalId>(signalId) < INT_SIGNAL_START){
+        out << "invalid signal id" << std::endl;
+        return;
+    }
+
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(static_cast<TaskId>(targetTaskId));
+    if(taskIter != _taskMap.cend()) {
+        auto evt = new_e(static_cast<SignalId>(signalId));
+        postEvent(static_cast<TaskId>(targetTaskId), evt);
+        out << "signal id: " << (unsigned)signalId << " -> task id: " << (unsigned)targetTaskId << std::endl;
+    } else {
+        out << "invalid task id" << std::endl;
+    }
+}
+
+void FW::_cliPostSignalWithSource(std::ostream& out, int signalId, int targetTaskId, int sourceTaskId) {
+    if(static_cast<SignalId>(signalId) < INT_SIGNAL_START){
+        out << "invalid signal id" << std::endl;
+        return;
+    }
+
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(static_cast<TaskId>(targetTaskId));
+    if(taskIter != _taskMap.cend()) {
+        auto evt = new_e(static_cast<SignalId>(signalId));
+        evt->source =  static_cast<TaskId>(sourceTaskId);
+        postEvent(static_cast<TaskId>(targetTaskId), evt);
+        out << "signal id: " << (unsigned)signalId << " -> task id: " << (unsigned)targetTaskId << " w/ source id: " << (unsigned)sourceTaskId << std::endl;
+    } else {
+        out << "invalid task id" << std::endl;
+    }
+}
+
+void FW::_cliPublishSignal(std::ostream& out, int signalId){
+    auto subListIter = _subsMap.find(static_cast<SignalId>(signalId));
+    if(subListIter != _subsMap.cend()){
+        auto evt = new_e(static_cast<SignalId>(signalId));
+        publishEvent(evt);
+        out << "event published w/ signal id: " << (unsigned)signalId << '\n';
+    } else {
+        out << "this signal has no subscribers" << std::endl;
+    }
+}
+
+void FW::_cliPublishSignalWithSource(std::ostream& out, int signalId, int sourceTaskId){
+    auto subListIter = _subsMap.find(static_cast<SignalId>(signalId));
+    if(subListIter != _subsMap.cend()){
+        auto evt = new_e(static_cast<SignalId>(signalId));
+        evt->source =  static_cast<TaskId>(sourceTaskId);
+        publishEvent(evt);
+        out << "event published w/ signal id: " << (unsigned)signalId << " and source id: " << (unsigned)sourceTaskId << '\n';
+    } else {
+        out << "this signal has no subscribers" << std::endl;
+    }
+}
+
+void FW::_cliPostEvent(std::ostream& out, int signalId, const std::string& jsonPath, int targetTaskId){
+    _cliPostEventCommon(out, static_cast<SignalId>(signalId), jsonPath, static_cast<TaskId>(targetTaskId));
+}
+
+void FW::_cliPostEventWithSource(std::ostream& out, int signalId, const std::string& jsonPath, int targetTaskId, int sourceTaskId){
+    _cliPostEventCommon(out, static_cast<SignalId>(signalId), jsonPath, static_cast<TaskId>(targetTaskId), static_cast<TaskId>(sourceTaskId));
+}
+
+void FW::_cliPublishEvent(std::ostream& out, int signalId, const std::string& jsonPath) {
+    _cliPubEventCommon(out, static_cast<SignalId>(signalId), jsonPath);
+}
+
+void FW::_cliPublishEventWithSource(std::ostream& out, int signalId, const std::string& jsonPath, int sourceTaskId) {
+    _cliPubEventCommon(out, static_cast<SignalId>(signalId), jsonPath, static_cast<TaskId>(sourceTaskId));
+}
+
+void FW::_cliListAllTasks(std::ostream& out) {
+    std::shared_lock lock(_taskMutex);
+    for(const auto& pair : _taskMap){
+        out << "id: " << (unsigned)pair.first << " name: " << pair.second->getName() << "\n";
+    }
+}
+
+void FW::_cliListTasksWithSearch(std::ostream& out, const std::string& searchStr) {
+    std::shared_lock lock(_taskMutex);
+    for(const auto& pair : _taskMap) {
+        if(pair.second->getName().find(searchStr) != std::string::npos){
+            out << "id: " << (unsigned)pair.first << " name: " << pair.second->getName() << "\n";
+        }
+    }
+}
+
+void FW::_cliPostEventCommon(std::ostream& out, SignalId signalId, const std::string& jsonPath, TaskId targetTaskId, std::optional<TaskId> sourceTaskId){
+    if(signalId < INT_SIGNAL_START){
+        out << "invalid signal id" << std::endl;
+        return;
+    }
+    
+    std::shared_lock lock(_taskMutex);
+    auto taskIter = _taskMap.find(targetTaskId);
+    if(taskIter != _taskMap.cend()) {
+        // Read the JSON file
+        std::ifstream file(jsonPath);
+        if (file.is_open()) {
+            nlohmann::json jsonData;
+            try {
+                // json parse
+                file >> jsonData;
+                // send to task
+                taskIter->second->cliEventSink(out, signalId, jsonData, sourceTaskId);   
+            } catch (const nlohmann::json::parse_error& e) {
+                out << "Json parse error: " << e.what() << '\n';
+            }
+            file.close();
+        } else {
+            out << "Could not open file\n";
+        }
+    } else {
+        out << "invalid task id" << std::endl;
+    }
+}
+
+void FW::_cliPubEventCommon(std::ostream& out, SignalId signalId, const std::string& jsonPath, std::optional<TaskId> sourceTaskId) {
+    auto subListIter = _subsMap.find(signalId);
+    if(subListIter != _subsMap.cend()){
+        // Read the JSON file
+        std::ifstream file(jsonPath);
+        if (file.is_open()) {
+            nlohmann::json jsonData;
+            try {
+                // json parse
+                file >> jsonData;
+                // send to all subs
+                std::shared_lock lock(_taskMutex);
+                for(TaskId taskId : subListIter->second){
+                    _taskMap.find(taskId)->second->cliEventSink(out, signalId, jsonData, sourceTaskId);
+                }
+            } catch (const nlohmann::json::parse_error& e) {
+                out << "Json parse error: " << e.what() << '\n';
+            }
+            file.close();
+        } else {
+            out << "Could not open file\n";
+        }
+    } else {
+        out << "this signal has no subscribers" << std::endl;
     }
 }
 

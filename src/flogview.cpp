@@ -1,5 +1,5 @@
 
-#include "flogview.h"
+#include "detail/flogview.h"
 
 FLogViewBase::FLogViewBase(finalcut::FWidget* parent, uint_fast16_t logSize) : finalcut::FDialog{parent}, _logSize{logSize} {
     //
@@ -397,6 +397,9 @@ FLogViewMulti::FLogViewMulti(finalcut::FWidget* parent, uint_fast16_t scrollBack
 }
 
 bool FLogViewMulti::createView(uint_fast16_t viewId, const std::string& viewName) {
+    // lock logger view access
+    std::lock_guard<std::mutex> lg(_loggerViewMtx);
+    
     if(_viewMap.size() >= _viewSize) {
         return false;
     }
@@ -406,10 +409,10 @@ bool FLogViewMulti::createView(uint_fast16_t viewId, const std::string& viewName
     
     // return false if emplace is not succesful
     if(result) {
-        _dropdownViewSelect.insert(viewName, iter->first);
+        _dropdownViewSelect.insert(viewName, uint_fast16_t{viewId});    // insert needs a non-cost rvalue for storing data
         if(_viewMap.size() == 1){
             _activeViewId = viewId;
-            _dropdownViewSelect.setCurrentItem(0);
+            _dropdownViewSelect.setCurrentItem(0);  // is this needed?
         }
         _dropdownViewSelect.redraw();
     } 
@@ -417,12 +420,15 @@ bool FLogViewMulti::createView(uint_fast16_t viewId, const std::string& viewName
 }
 
 void FLogViewMulti::removeView(uint_fast16_t viewId) {
+    // lock logger view access
+    std::unique_lock<std::mutex> lg(_loggerViewMtx);
+
     if(_viewMap.find(viewId) == _viewMap.cend()) {
         return;
     }
 
     // locate and remove view from ddlist
-    _isRemoving = true;
+    _isRemoving = true; // to return from _dropdownChangedCb triggered by setCurrentItem()
     for(std::size_t i = 1; i <= _dropdownViewSelect.getCount(); i++){
         _dropdownViewSelect.setCurrentItem(i);
         auto data = _dropdownViewSelect.getItemData<uint_fast16_t>();
@@ -436,6 +442,7 @@ void FLogViewMulti::removeView(uint_fast16_t viewId) {
 
             // call cb manually
             _isRemoving = false;
+            lg.unlock(); // unlock before removing item to avoid deadlock in _dropdownChangedCb
             _dropdownChangedCb();
             break;
         }
@@ -546,10 +553,13 @@ void FLogViewMulti::_dropdownChangedCb(void) {
     if(_isRemoving){
         return;
     }
+
+    // lock logger view access
+    std::lock_guard<std::mutex> lg(_loggerViewMtx);
     
     if(_dropdownViewSelect.getCount() == 0) {
         // lock logger view access
-        std::lock_guard<std::mutex> lg(_loggerViewMtx); 
+        // std::lock_guard<std::mutex> lg(_loggerViewMtx); 
         // clear logger view
         FLogViewBase::clear();
     } else {
@@ -559,7 +569,7 @@ void FLogViewMulti::_dropdownChangedCb(void) {
         if(currentViewId != _activeViewId) {
             _activeViewId = currentViewId;
             // lock logger view access
-            std::lock_guard<std::mutex> lg(_loggerViewMtx); 
+            // std::lock_guard<std::mutex> lg(_loggerViewMtx); 
 
             _filter(_viewMap.find(_activeViewId)->second);
         }

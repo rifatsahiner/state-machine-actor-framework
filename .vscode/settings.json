@@ -59,7 +59,32 @@
         "iomanip": "cpp",
         "shared_mutex": "cpp",
         "codecvt": "cpp",
-        "cassert": "cpp"
+        "cassert": "cpp",
+        "any": "cpp",
+        "strstream": "cpp",
+        "cfenv": "cpp",
+        "charconv": "cpp",
+        "compare": "cpp",
+        "complex": "cpp",
+        "concepts": "cpp",
+        "coroutine": "cpp",
+        "set": "cpp",
+        "expected": "cpp",
+        "source_location": "cpp",
+        "format": "cpp",
+        "future": "cpp",
+        "numbers": "cpp",
+        "ranges": "cpp",
+        "semaphore": "cpp",
+        "span": "cpp",
+        "stop_token": "cpp",
+        "cinttypes": "cpp",
+        "typeindex": "cpp",
+        "valarray": "cpp",
+        "variant": "cpp",
+        "unordered_set": "cpp",
+        "regex": "cpp",
+        "syncstream": "cpp"
     },
     "makefile.launchConfigurations": [
         {
@@ -68,5 +93,8 @@
             "binaryArgs": []
         }
     ],
-    "makefile.configureOnOpen": true
+    "makefile.configureOnOpen": true,
+    "cmake.automaticReconfigure": false,
+    "cmake.configureOnOpen": false,
+    "cmake.configureOnEdit": false
 }

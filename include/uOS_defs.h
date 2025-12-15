@@ -2,14 +2,22 @@
 #define uOS_DEFS_H
 
 #include <cstdint>
-#include <memory>
 #include <optional>
+#include <memory>
 
-static constexpr uint_fast16_t uOS_FW_MAX_TASK_COUNT = 256; 
+static constexpr uint_fast16_t uOS_FW_MAX_TASK_COUNT = 512; 
+static constexpr uint_fast16_t uOS_FW_MAX_TIMER_COUNT = 2048;
 
 
 namespace uOS {
 
+
+// timerId
+#if uOS_FW_MAX_TIMER_COUNT > 65536
+using TimerId = uint_fast32_t;
+#else
+using TimerId = uint_fast16_t;
+#endif
 
 // taskId
 #if uOS_FW_MAX_TASK_COUNT > 256
@@ -28,31 +36,43 @@ constexpr SignalId SIG_TICK_HOUR = static_cast<SignalId>(6);
 
 /// Offsets for user signals
 constexpr SignalId INT_SIGNAL_START = static_cast<SignalId>(7);
-constexpr SignalId EXT_SIGNAL_START = static_cast<SignalId>(32);
+constexpr SignalId EXT_SIGNAL_START = static_cast<SignalId>(64);
 
 // event
 struct Event {
     SignalId signal;
     std::optional<TaskId> source;
+
+    constexpr Event(SignalId s = 0, std::optional<TaskId> src = std::nullopt)
+        : signal(s), source(src) {}
+
+    virtual ~Event() = default;
 };
 
 // event utility
 template <class T = Event>
-T* new_e(std::optional<SignalId> signalId = std::nullopt)
+std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
 {
     static_assert(std::is_base_of_v<Event, T>);
     
-    T* newEventPtr = new T; 
-    if(signalId){
-        newEventPtr->signal = signalId.value();
+    auto ptr = std::make_shared<T>();
+    if (signalId) {
+        ptr->signal = signalId.value();
     }
-    return newEventPtr;
+    return ptr;
 }
 
 template <class T>
-const T* recast_e(std::shared_ptr<const Event>& eventSptr){
+const T& recast_e(const Event& eventRef) {
     static_assert(std::is_base_of_v<Event, T>);
-    return static_cast<const T*>(eventSptr.get());
+#ifndef NDEBUG  // Debug mode: Exact runtime type check
+    if (typeid(eventRef) != typeid(T)) {
+        throw std::runtime_error("Type mismatch in recast_e: Expected exactly " + 
+                                 std::string(typeid(T).name()) + 
+                                 ", got " + std::string(typeid(eventRef).name()));
+    }
+#endif
+    return static_cast<const T&>(eventRef);
 }
 
 // log levels

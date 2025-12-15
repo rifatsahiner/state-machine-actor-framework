@@ -1,0 +1,15 @@
+
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: uOS
+Description: Hierarchical state-machine framework C++ library.
+Version: @PROJECT_VERSION@
+URL: https://github.com/rifatsahiner/state-machine-framework
+Requires: fmt >= 11.1
+Requires.private: finalcut ncurses libdw
+Libs: -L${libdir} -luOS -pthread
+Libs.private: -lrt -lgpm
+Cflags: -I${includedir}/uOS

@@ -2,83 +2,163 @@
 #include <cassert>
 
 #include "uOS.h"
-#include "logger.h"
 
 
 namespace uOS {
 
 
-Task::Task(const TaskId taskId, std::string&& taskName) : _id{taskId}, _name{std::move(taskName)} {
-    Logger::addTaskLogger(_id, _name);
-}
+Task::Task(const TaskId taskId, const std::string& taskInstName) : _id{taskId}, _instName{taskInstName} {}
 
 Task::~Task() {
     Logger::removeTaskLogger(_id);
+}
+
+void Task::init(void){
+    // get task specific data from overriden functions
+    _taskName = _getTaskName();
+    _stateNameMap = _getStateNameMap();
+
+    // register task to logger
+    Logger::addTaskLogger(_id, _taskName, _instName);
+
+    LOG(LogLevel::LOG_INFO, "Instance {} is initialized", _instName);
+
+    // note: this function is needed because these pure virtual functions cannot be called in constructor
 }
 
 void Task::start(void)
 {
     assert(_isRunning == false);
 
-    // clear event queue
-    std::queue<std::shared_ptr<const Event>> empty;
-    std::swap(_eventQueue, empty);
-
-    init();
-
-    resume();
+    StateMachine::init();
+    resume(true);
 }
 
 void Task::putEvent(std::shared_ptr<const Event>&& newEvent)
 {    
     // lock the queue
-    std::lock_guard<std::mutex> lock(_queueMutex);
+    std::lock_guard<std::mutex> lock(_threadMutex);
 
     // put event into te queue
     _eventQueue.emplace(std::move(newEvent));
     
-    if(_isUnlocked == false){
-        std::lock_guard<std::mutex> threadLock (_threadMutex);
-        _isUnlocked = true;
-        _taskCv.notify_one();
-    }
+    _taskCv.notify_one();  // Always notify (safe: spurious wakes are harmless)
 }
 
-void Task::stop(void) 
+#ifndef NDEBUG
+bool Task::isIdle(void) {
+    std::lock_guard<std::mutex> lock(_threadMutex);
+    // std::cout << "queue: " << _eventQueue.size() << ", processing: " << _isProcessing.load(std::memory_order_relaxed) << std::endl;
+    return _eventQueue.empty() && _isProcessing.load(std::memory_order_relaxed) == false;
+}
+#endif
+
+void Task::stop(bool waitJoin) 
 {    
-    // bool isEmpty;
-
-    // lock the queue and store empty info for notify
-    // std::lock_guard<std::mutex> lock(_queueMutex);
-    // isEmpty = _eventQueue.empty();
-    
-    _isRunning = false;
-    
-    if(_isUnlocked == false){
-        std::lock_guard<std::mutex> threadLock (_threadMutex);
-        _isUnlocked = true;
-        _taskCv.notify_one();
+    {
+        std::lock_guard<std::mutex> lock(_threadMutex);
+        _isRunning = false;
+        _taskCv.notify_one();  // Wake if waiting (predicate will see !_isRunning)
     }
-    _taskThead.join();  // todo: bool bir parametre ile bekleme olmadan da çıkılabilecek
+
+    if(waitJoin == true){
+        if(_taskThead.joinable()) {
+            LOG(LogLevel::LOG_INFO, "Waiting for task thread to join");
+            _taskThead.join();
+        } else {
+            LOG(LogLevel::LOG_WARNING, "Task thread is not joinable, may be already stopped or not started");
+        }
+    }
+
+    LOG(LogLevel::LOG_INFO, "Task stopped");
 }
 
-void Task::resume(void) {
+void Task::resume(bool cleanStart) {
     if(_isRunning == false)
     {
+        if(cleanStart == true) {
+            // clear event queue
+            std::lock_guard<std::mutex> lock(_threadMutex);
+            std::queue<std::shared_ptr<const Event>> empty;
+            std::swap(_eventQueue, empty);
+        }
+
         _isRunning = true;
         _taskThead = std::thread {&Task::_taskLoop, this};
-        // hem isRunning hem de _getEvent==nullptr condition_variable ile nasıl handle ediyor qp'ye bak
+
+        std::ostringstream oss;
+        oss << _taskThead.get_id();  // thread id is not formatable, so use ostringstream
+        LOG(LogLevel::LOG_INFO, "Task started with thread id: {}", oss.str());
     }
 }
 
-void Task::subscribe(SignalId signalId) { FW::subscribe(signalId, _id); }
+std::string Task::getName(void) const {
+    return _taskName + "-" + _instName;
+}
 
-void Task::unsubscribe(SignalId signalId) { FW::unsubscribe(signalId, _id); }
+std::string_view Task::getState(void) const
+{
+    State currentState = _getState();
+    for(const auto& [state, name] : _stateNameMap) {
+        if(currentState == state) {
+            return name;
+        }
+    }
+    
+    assert(false);
+}
 
-// todo: bunu _putEvent yapabilir miyiz?
-// bu değişecek const Event* alacak, içeride FW::post çağıracak
-// yada postSelf olabilir
-void Task::putEvent(std::shared_ptr<const Event>& event) { putEvent(std::move(event)); }
+void Task::cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::json& json, std::optional<TaskId> sourceTaskId) {
+    (void)signalId;
+    (void)json;
+    (void)sourceTaskId;
+
+    out << "event injector handler is not implemented for this task. id: " << (unsigned)_id << "\n";
+}
+
+Task::HandleResult Task::_terminationState(const std::shared_ptr<const uOS::Event>& event){
+    HandleResult res;
+
+    // call self-delete on entry and discard all events
+    switch(event->signal) {
+        case ENTRY_SIG : {
+            LOG(LogLevel::LOG_INFO, "ENTRY for TERMINATION-STATE");
+            _selfDelete();
+            res = _handled();
+            break;
+        }
+
+        default: {
+            res = _super(&Task::top);
+            break;
+        }
+    }
+
+    return res;
+}
+
+void Task::_subscribe(SignalId signalId) { FW::subscribe(signalId, _id); }
+
+void Task::_subscribe(std::initializer_list<SignalId> signalList) { FW::subscribe(signalList, _id); }
+
+void Task::_unsubscribe(SignalId signalId) { FW::unsubscribe(signalId, _id); }
+
+void Task::_unsubscribe(std::initializer_list<SignalId> signalList) { FW::unsubscribe(signalList, _id); }
+
+void Task::_selfPost(std::shared_ptr<const Event> event)
+{
+    putEvent(std::move(event));
+}
+
+TimerId Task::_selfPostIn(uint_fast16_t intervalMs, std::shared_ptr<const Event> event) { return FW::postEventIn(intervalMs, _id, std::move(event)); }
+
+TimerId Task::_selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event> event) { return FW::postEventEvery(intervalMs, _id, std::move(event)); }
+
+void Task::_selfStop(void) { FW::stop(_id); }
+
+void Task::_selfDelete(void) { FW::delete_(_id); }
+
+void Task::_registerCliMenu(std::unique_ptr<cli::Menu>&& menuPtr) { FW::registerCliMenu(_id, std::move(menuPtr)); }
 
 //////////////////////////////////////////////////////
 //                                                  //
@@ -86,50 +166,42 @@ void Task::putEvent(std::shared_ptr<const Event>& event) { putEvent(std::move(ev
 
 void Task::_taskLoop(void)
 {
-    // create thread lock
     std::unique_lock<std::mutex> threadLock(_threadMutex);
-    _isUnlocked = true;
 
-    LOG(LogLevel::LOG_INFO, "task thread loop started !!!");
+    LOG(LogLevel::LOG_INFO, "Task thread loop entry");
 
-    while(_isRunning)
-    {
-        // get and handle event. suspend if queue is empty
-        std::shared_ptr<const Event> currentEvent = _getEvent();
-        
-        if(currentEvent != nullptr) {
-            dispatch(currentEvent);
-        } else {
-            LOG(LogLevel::LOG_TRACE, "queue is empty, will sleep");
-            currentEvent.reset();
-            _isUnlocked = false;
-            _taskCv.wait(threadLock, [this] {return _isUnlocked;});
-            LOG(LogLevel::LOG_TRACE, "awake");
+    while (true) {
+        // Wait while empty and running (atomic under mutex)
+        while (_eventQueue.empty() && _isRunning) {
+            _taskCv.wait(threadLock);
         }
-    }
-    
-    threadLock.unlock();
-    LOG(LogLevel::LOG_INFO, "task thread loop ended !!!");
-    return;
-}
 
-std::shared_ptr<const Event> Task::_getEvent(void)
-{
-    std::shared_ptr<const Event> returnEvent;
+        if (!_isRunning) {
+            break;
+        }
 
-    // lock the queue
-    std::lock_guard<std::mutex> lock(_queueMutex);
-    
-    if(_eventQueue.empty() == false)
-    {
-        returnEvent = std::move(_eventQueue.front());
-        //std::cout << "get event - event copy count = " << returnEvent.use_count() << std::endl;
+#ifndef NDEBUG
+        _isProcessing.store(true, std::memory_order_relaxed);
+#endif
+
+        // Queue not empty: pop while holding
+        auto currentEvent = std::move(_eventQueue.front());
         _eventQueue.pop();
-        
-        LOG(LogLevel::LOG_TRACE, "get event -> signalId: {}", returnEvent->signal);
-    }
 
-    return returnEvent;  // move ediliyor (NRVO)
+        threadLock.unlock();  // Release for dispatch (non-blocking)
+
+        LOG(LogLevel::LOG_TRACE, "get event -> signalId: {}", currentEvent->signal);
+        dispatch(*currentEvent);
+
+#ifndef NDEBUG
+        _isProcessing.store(false, std::memory_order_relaxed);
+#endif
+
+        threadLock.lock();  // Re-acquire for next iteration's check
+    }
+      
+    threadLock.unlock();
+    LOG(LogLevel::LOG_INFO, "Task thread loop exit");
 }
 
 

@@ -6,9 +6,12 @@
 #include <condition_variable>
 #include <queue>
 
-#include "logger.h"
-//#include "uOS_defs.h"
 #include "state_machine.h"
+#include "detail/logger.h"
+#include "detail/json_fwd.h"
+
+
+namespace cli { class Menu; }
 
 
 namespace uOS {
@@ -19,57 +22,78 @@ class Task : public StateMachine
     public:
         virtual ~Task();
 
+        // framework service methods, do not use in user task code
+        void init(void);
         void start(void);
-        void stop(void);
-        void resume(void);
+        void stop(bool waitJoin = true);
+        void resume(bool cleanStart = true);
         void putEvent(std::shared_ptr<const Event>&&);
-        //void deleteTask(void);  // delete is keyword -- destructor ile yapabiliriz
+        std::string getName(void) const;
+        std::string_view getState(void) const;
+#ifndef NDEBUG
+        bool isIdle(void);
+#endif
+
+        virtual void cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::json& json, std::optional<TaskId> sourceTaskId = std::nullopt);
 
     protected:
-        Task(const TaskId, std::string&&);
-        Task() = delete;
+        Task(const TaskId, const std::string&);
         Task(const Task& other) = delete;
         Task& operator= (const Task& rhs) = delete;
 
-        void subscribe(SignalId);
-        void unsubscribe(SignalId);
-        void putEvent(std::shared_ptr<const Event>&);   // todo: bunun adı selfPost benzeri birşey olacak
+        // termination psude-state -> 🔘
+        // user tasks can override this if a custom termination needed
+        virtual HandleResult _terminationState(const std::shared_ptr<const Event>&);
+
+        // user task service methods
+        void _subscribe(SignalId);
+        void _subscribe(std::initializer_list<SignalId>);
+        void _unsubscribe(SignalId);
+        void _unsubscribe(std::initializer_list<SignalId>);
+        void _selfPost(std::shared_ptr<const Event>);
+        TimerId _selfPostIn(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
+        TimerId _selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
+        void _selfStop(void);
+        void _selfDelete(void);
+        void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 
         const TaskId _id;
-        const std::string _name;
         
         template <class T = Event>
-        T* new_e(std::optional<SignalId> signalId = std::nullopt)
+        std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
         {
-            T* e = uOS::new_e<T>(signalId);
+            std::shared_ptr<T> e = uOS::new_e<T>(signalId);
             e->source = _id;
             return e;
         }
 
     private:
-        void _taskLoop(void);
-        std::shared_ptr<const Event> _getEvent(void);
+        // task name and state-name map will be provided from tasks
+        virtual std::string _getTaskName(void) const = 0;
+        virtual std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const = 0;
+        std::string _instName;
+        std::string _taskName;
+        std::vector<std::pair<State, std::string_view>> _stateNameMap;  // couldnt make State work as a key for unordered_map or map, so using vector of pairs
 
         std::queue<std::shared_ptr<const Event>> _eventQueue;
-        std::mutex _queueMutex;
-
-        volatile bool _isRunning = false;
-        volatile bool _isUnlocked = true;
+        bool _isRunning = false;
         std::thread _taskThead;
         std::mutex _threadMutex;
         std::condition_variable _taskCv;
+#ifndef NDEBUG
+        std::atomic<bool> _isProcessing{false};  // Only in non-release
+#endif
+
+        void _taskLoop(void);
 
     protected:
-        template <class... LogStrArgs>
-        void log__(const char* file, const char* function, int line, LogLevel level, const std::string& logStr, LogStrArgs&... logStrArgs) {
-            if(Logger::isActive() == false) {
-                return;
-            }
+        template <typename... LogStrArgs>
+        void log__(const char* file, const char* function, int line, LogLevel level, fmt::format_string<LogStrArgs...> logStr, LogStrArgs&&... logStrArgs) {
             // format logStr
-            auto formattedStr = fmt::format(logStr, logStrArgs...);
+            auto formattedStr = fmt::format(logStr, std::forward<LogStrArgs>(logStrArgs)...);
 
             // sent to logger
-            Logger::logTask(file, function, line, level, formattedStr, _id);
+            Logger::logTask(file, function, line, level, formattedStr, _id, _taskName + '-' + _instName);
         } 
 };
 

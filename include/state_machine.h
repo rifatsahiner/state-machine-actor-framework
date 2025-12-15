@@ -7,59 +7,47 @@
 namespace uOS {
 
 
-enum class HandleResult : uint_fast8_t {
-    Handled,
-    Unhandled,
-    Trans,
-    Super,
-    Ignored
-};
-
-// definition for state-handler function
-class StateMachine;
-using State = HandleResult (StateMachine::*) (const std::shared_ptr<const Event>&);
-
-//////////////////////////////////////////////////////
-//                                                  //
-//////////////////////////////////////////////////////
-
 class StateMachine {
-    public:        
+    public:
+        // definition for state-handler function
+        enum class HandleResult : uint_fast8_t {
+            Handled,
+            Unhandled,
+            Trans,
+            Super,
+            Ignored
+        };
+        using State = HandleResult (StateMachine::*) (const Event&);
+
         StateMachine() : _currentState{&StateMachine::top} {}
         virtual ~StateMachine() {};
 
         void init(void);
-        void dispatch(const std::shared_ptr<const Event>& event);
+        void dispatch(const Event& event);
         bool isIn(const State);
 
     protected:
-        // ??
-        State getState(void) const { return _currentState; }
+        State _getState(void) const { return _currentState; }
 
         // conceptual UML top state that ignores all events
-        HandleResult top(const std::shared_ptr<const Event>& event) {
+        HandleResult top(const Event& event) {
             (void)event;
             return HandleResult::Ignored;
         }
 
-        //
         // macro-like functions for event handle returns (handled/unhandled/transiton/superstate)
-        //
-        static constexpr HandleResult handled(void) { return HandleResult::Handled; }
-
-        static constexpr HandleResult unhandled(void) { return HandleResult::Unhandled; }   // because of a guard
-
+        static constexpr HandleResult _handled(void) { return HandleResult::Handled; }
+        static constexpr HandleResult _unhandled(void) { return HandleResult::Unhandled; }   // because of a guard
         template<typename T>
-        constexpr HandleResult trans(T target) {
+        constexpr HandleResult _trans(T target) {
             static_assert(std::is_base_of_v<StateMachine, remove_ptr_to_member_func_t<T>>);
             
             // store target in temp and return result as state transition
             _tempTargetState = static_cast<State>(target);
             return HandleResult::Trans;
         }
-
         template<typename T>
-        constexpr HandleResult super(T superstate) {
+        constexpr HandleResult _super(T superstate) {
             static_assert(std::is_base_of_v<StateMachine, remove_ptr_to_member_func_t<T>>);
             
             // store superstate in temp and return result as delegated to superstate
@@ -79,6 +67,8 @@ class StateMachine {
         State _tempTargetState;     // temporary state: target of transition or superstate
 
         State _procInitTrans(void);
+
+        // top initial transition that every UML state machine must provide
         virtual HandleResult _topInitialTrans(void) = 0;
 
     private:
@@ -87,7 +77,7 @@ class StateMachine {
         template <typename> struct remove_ptr_to_member_func;
 
         template <typename T>
-        struct remove_ptr_to_member_func<HandleResult (T::*)(const std::shared_ptr<const Event>&)> {
+        struct remove_ptr_to_member_func<HandleResult (T::*)(const Event&)> {
             using type = T;
         };
 
