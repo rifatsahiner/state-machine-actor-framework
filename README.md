@@ -1,23 +1,25 @@
-# state-machine-framework
-A full-fledged UML state-machine framework with support for hierarchical (nested) states   
+# state-machine-actor-framework
+A full-fledged actor model framework with support for hierarchical (nested) UML state-machines
 
-- Divide and conquire with encapsulated 'tasks' that are constructed as [hierarchical state machines](https://en.wikipedia.org/wiki/UML_state_machine)
-- Dynamic task creation and related thread management
+- Divide and conquire your projects with encapsulated ["actors"](https://en.wikipedia.org/wiki/Actor_model) that are constructed as [hierarchical state machines](https://en.wikipedia.org/wiki/UML_state_machine)
+- Dynamic actor creation and related thread management
 - Zero-copy event delivery system with thread safe event queue structures
 - Timed event delivery
-- Publish-subscribe communication
-- System-wide state monitoring with comprehensive TUI
+- Direct or publish-subscribe actor communication
+- System-wide state monitoring with built-in TUI
+- Built-in CLI utility for event-injection or other test/trigger purposes
+
+
+![Framework TUI](images/tui.png)
+
+This framework is exceptionaly good as a project base for AI asisted/generated development;
+- Code complete or agents easily understand the state transition pattern of individual tasks for tab-tab-tab programming
+- Fully encapsulated actors present small pills of context for AI that prevents it to go astray
 
 <br>
 
-This framework is exceptionaly good as a project base for AI asisted/generated code;
-- Code complate or agents easily understand the state transition pattern of individual tasks for tab-tab-tab programming
-- Fully encapsulated tasks present small pills of context for AI that prevents it to go astray
-
-<br>
-
-Inspired and based on 2008 book of "Practical UML Statecharts in C/C++" which is intended for embedded systems.   
-This implementation of UML state-machine framework however is intended for high level server side applications and written in modern C++17
+Inspired and based on 2008 book "Practical UML Statecharts in C/C++" by Miro Samek which is intended for embedded systems.   
+This implementation of UML state-machine framework, however, is intended for high level server side applications and written in modern C++17
 
 <br>
 
@@ -31,7 +33,6 @@ This implementation of UML state-machine framework however is intended for high 
 - ncurses
 
 ## Tools
-- GNU CXX 20
 - CMake >3.15
 - GIT
 - pkg-config
