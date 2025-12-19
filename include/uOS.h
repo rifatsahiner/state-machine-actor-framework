@@ -78,7 +78,7 @@ class FW
 
         // task related
         static inline std::array<bool, uOS_FW_MAX_TASK_COUNT> _taskIdUsageList;
-        static inline std::unordered_map<TaskId, std::unique_ptr<Task>> _taskMap;
+        static inline std::unordered_map<TaskId, std::unique_ptr<AsyncTask>> _taskMap;
         static inline std::shared_mutex _taskMutex;
         static inline std::vector<TaskId> _stopList;
         static inline std::vector<TaskId> _deleteList;
@@ -142,7 +142,7 @@ class FW
         template <class T, class... TaskArgs>
         static TaskId createTask(std::string taskName = "no-name-inst", TaskArgs&&... taskArgs)
         {   
-            static_assert(std::is_base_of_v<Task, T>);
+            static_assert(std::is_base_of_v<AsyncTask, T>);
             std::lock_guard lock(_taskMutex);
 
             TaskId newTaskId = FW::_getAvailableTaskId();

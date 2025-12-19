@@ -41,3 +41,7 @@ This implementation of UML state-machine framework, however, is intended for hig
 - autoconf
 - autotools-dev
 - autoconf-archive
+
+rescue yourself from concurency/multi-threding hell with fully encapsulated actors
+rescue yourself from convoluted logics, 50 tier elseif, numerous flags with UML state-machines 
+this framework marries two best concepts of programming on OOP ground: the actor-model and hierarchical UML state-machines (which is essentialy OOP for finite state machines)

@@ -27,8 +27,9 @@ set(LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib")
 # Gather source files
 set(SOURCES
     ${SRC_DIR}/uOS.cpp
-    ${SRC_DIR}/task.cpp
     ${SRC_DIR}/state_machine.cpp
+    ${SRC_DIR}/task.cpp
+    ${SRC_DIR}/async_task.cpp
     ${SRC_DIR}/logger.cpp
     ${SRC_DIR}/flogview.cpp)
 

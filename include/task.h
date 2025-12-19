@@ -20,26 +20,28 @@ namespace uOS {
 class Task : public StateMachine
 {
     public:
-        virtual ~Task();
-
         // framework service methods, do not use in user task code
         void init(void);
         void start(void);
-        void stop(bool waitJoin = true);
-        void resume(bool cleanStart = true);
-        void putEvent(std::shared_ptr<const Event>&&);
+        virtual void stop(bool waitJoin = true) = 0;
+        virtual void resume(bool cleanStart = true) = 0;
+        virtual void putEvent(std::shared_ptr<const Event>&&) = 0;
         std::string getName(void) const;
         std::string_view getState(void) const;
 #ifndef NDEBUG
-        bool isIdle(void);
+        virtual bool isIdle(void) = 0;
 #endif
-
         virtual void cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::json& json, std::optional<TaskId> sourceTaskId = std::nullopt);
+
+        ~Task();
 
     protected:
         Task(const TaskId, const std::string&);
+        
         Task(const Task& other) = delete;
         Task& operator= (const Task& rhs) = delete;
+        Task(Task&&) = delete;
+        Task& operator=(Task&&) = delete;
 
         // termination psude-state -> 🔘
         // user tasks can override this if a custom termination needed
@@ -58,6 +60,8 @@ class Task : public StateMachine
         void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 
         const TaskId _id;
+        std::queue<std::shared_ptr<const Event>> _eventQueue;
+        bool _isRunning = false;
         
         template <class T = Event>
         std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
@@ -75,17 +79,6 @@ class Task : public StateMachine
         std::string _taskName;
         std::vector<std::pair<State, std::string_view>> _stateNameMap;  // couldnt make State work as a key for unordered_map or map, so using vector of pairs
 
-        std::queue<std::shared_ptr<const Event>> _eventQueue;
-        bool _isRunning = false;
-        std::thread _taskThead;
-        std::mutex _threadMutex;
-        std::condition_variable _taskCv;
-#ifndef NDEBUG
-        std::atomic<bool> _isProcessing{false};  // Only in non-release
-#endif
-
-        void _taskLoop(void);
-
     protected:
         template <typename... LogStrArgs>
         void log__(const char* file, const char* function, int line, LogLevel level, fmt::format_string<LogStrArgs...> logStr, LogStrArgs&&... logStrArgs) {
@@ -95,6 +88,30 @@ class Task : public StateMachine
             // sent to logger
             Logger::logTask(file, function, line, level, formattedStr, _id, _taskName + '-' + _instName);
         } 
+};
+
+class AsyncTask : public Task
+{
+    public:
+        void stop(bool waitJoin = true) override;
+        void resume(bool cleanStart = true) override;
+        void putEvent(std::shared_ptr<const Event>&& event) override;
+#ifndef NDEBUG
+        bool isIdle(void) override;
+#endif
+
+    protected:
+        using Task::Task;   // inherit constructor
+
+    private:
+        std::thread _taskThead;
+        std::mutex _threadMutex;
+        std::condition_variable _taskCv;
+#ifndef NDEBUG
+        std::atomic<bool> _isProcessing{false};  // Only in non-release
+#endif
+
+        void _taskLoop(void);
 };
 
 
