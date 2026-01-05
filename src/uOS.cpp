@@ -128,6 +128,7 @@ int32_t FW::run() {
     uint_fast8_t s = 0;
     uint_fast8_t m = 0;
     uint_fast8_t h = 0;
+    std::chrono::milliseconds::rep maxLoopDuration = 0;
 
     // onStartup() aşağıdaki satırlar
     // struct termios tio;                        // modified terminal attributes
@@ -147,10 +148,73 @@ int32_t FW::run() {
     LOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
     LOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
 
-    while(_isRunning) {
-        // now süresini al
-        auto now =  std::chrono::high_resolution_clock::now();
+    // get the start time
+    auto wakeup = std::chrono::steady_clock::now();
 
+    while(_isRunning) {
+        // handle sync tasks
+        // // make a copy of sync task pointers to avoid holding lock during runCycle calls
+        // std::shared_lock syncTaskCopyLock(_taskMutex);
+        // auto syncTaskListCopy = _syncTaskList;
+        // syncTaskCopyLock.unlock();
+        // for(const auto& syncTaskPtr : syncTaskListCopy){
+        //     syncTaskPtr->runCycle();
+        // }
+
+        for(uint_fast16_t i = 0; i < uOS_FW_MAX_TASK_COUNT; ++i){
+            std::shared_lock readlock(_taskMutex);
+            if(_taskIdUsageList[i]){
+                auto taskIter = _taskMap.find(static_cast<TaskId>(i));
+                assert(taskIter != _taskMap.cend());
+
+                // check if task is sync task
+                if(taskIter->second->getType() == Task::Type::Sync){
+                    // get ptr copy and release lock
+                    auto syncTaskPtr = std::static_pointer_cast<SyncTask>(taskIter->second);
+                    readlock.unlock();
+
+                    syncTaskPtr->runCycle();
+                }
+            }
+        }
+
+        // std::array<std::thread, 3> threadPool;
+        // for(std::size_t threadCounter = 0; threadCounter < 3; ++threadCounter) {
+        //     threadPool[threadCounter] = std::thread([threadCounter]() {
+        //         for (std::size_t i = threadCounter; i < uOS_FW_MAX_TASK_COUNT; i += 3) {
+        //             std::shared_lock readlock(_taskMutex);
+        //             if(_taskIdUsageList[i]){
+        //                 auto taskIter = _taskMap.find(static_cast<TaskId>(i));
+        //                 assert(taskIter != _taskMap.cend());
+
+        //                 // check if task is sync task
+        //                 if(taskIter->second->getType() == Task::Type::Sync){
+        //                     // get ptr copy and release lock
+        //                     auto syncTaskPtr = std::static_pointer_cast<SyncTask>(taskIter->second);
+        //                     readlock.unlock();
+
+        //                     syncTaskPtr->runCycle();
+        //                 }
+        //             }
+        //         }
+        //     });
+        // }
+        // for (auto& t : threadPool) {
+        //     if (t.joinable()) {
+        //         t.join();
+        //     }
+        // }
+#ifndef NDEBUG
+        auto durationAfterSyncTasks = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
+#endif
+
+        // handle timers
+        _handleTick();
+#ifndef NDEBUG
+        auto durationAfterTick = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
+#endif
+
+        // handle time events
         // check for second
         if(++s == 50) {
             _publishEvent(std::make_shared<const Event>(TICK_SEC_EVENT));
@@ -168,9 +232,9 @@ int32_t FW::run() {
                 }
             }
         }
-
-        // handle timers
-        _handleTick();
+#ifndef NDEBUG
+        auto durationAfterPublish = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
+#endif
 
         // handle cli
         if(_cli){
@@ -178,10 +242,21 @@ int32_t FW::run() {
         }
 
         // handle self stop and self delete request from tasks
-        _handleStopDelete();
+        _handleDelete();
 
-        // sleep_until now + 20ms
-        std::this_thread::sleep_until(now + 20ms);
+        auto loopDuration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
+        if(maxLoopDuration < loopDuration){
+            maxLoopDuration = loopDuration;
+#ifndef NDEBUG
+            LOG(uOS::LogLevel::LOG_WARNING, "New max loop duration: {} ms. after publish: {}, after sync tasks: {}, after tick: {} ms", maxLoopDuration, durationAfterPublish, durationAfterSyncTasks, durationAfterTick);
+#else
+            LOG(uOS::LogLevel::LOG_WARNING, "New max loop duration: {} ms.", maxLoopDuration);            
+#endif
+        }
+
+        // sleep_remaining of 20ms loop period
+        wakeup += 20ms;
+        std::this_thread::sleep_until(wakeup);
     }
 
     // terminate all task threads
@@ -275,9 +350,16 @@ void FW::deleteTask(TaskId taskId){
         // get task name before deletion
         std::string taskName = taskIter->second->getName();
 
-        // delete from map and make its taskId available
+        // delete from map, make its taskId available and remove from sync task list if necessary
+        // if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
+        //     auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTaskPtr);
+        //     if(syncTaskIt != _syncTaskList.end()){
+        //         _syncTaskList.erase(syncTaskIt);
+        //     }
+        // }
         assert(_taskMap.erase(taskId) == 1);
         _taskIdUsageList[taskId] = false;
+
 
         // remove its cli menu if necessary
         if(_cli){
@@ -454,14 +536,17 @@ void FW::unsubscribe(std::initializer_list<SignalId> signalList, TaskId subsId)
     }
 }
 
-void FW::stop(TaskId taskId) {
-    // add to stop list
-    std::lock_guard<std::mutex> lock(_listMutex);
-    _stopList.push_back(taskId);
-    LOG(LogLevel::LOG_INFO, "Self stop is schduled for task id: {}", taskId);
-}
+// void FW::stop(TaskId taskId) {
+//     // add to stop list
+//     std::lock_guard<std::mutex> lock(_listMutex);
+//     _stopList.push_back(taskId);
+//     LOG(LogLevel::LOG_INFO, "Self stop is schduled for task id: {}", taskId);
+// }
 
-void FW::delete_(TaskId taskId) {
+void FW::deleteAsyncTask(TaskId taskId) {
+    // stop task first
+    stopTask(taskId, false);
+
     // add to delete list
     std::lock_guard<std::mutex> lock(_listMutex);
     _deleteList.push_back(taskId);
@@ -695,16 +780,16 @@ void FW::_handleTick(void)  // todo: inline yap
     }
 }
 
-void FW::_handleStopDelete(void)  // todo: inline yap
+void FW::_handleDelete(void)  // todo: inline yap
 {
     std::lock_guard<std::mutex> lock(_listMutex);
     
-    if(_stopList.empty() == false){
-        for(TaskId taskId : _stopList){
-            stopTask(taskId);
-        }
-        _stopList.clear();
-    }
+    // if(_stopList.empty() == false){
+    //     for(TaskId taskId : _stopList){
+    //         stopTask(taskId);
+    //     }
+    //     _stopList.clear();
+    // }
     
     if(_deleteList.empty() == false){
         for(TaskId taskId : _deleteList){

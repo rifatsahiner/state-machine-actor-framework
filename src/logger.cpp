@@ -5,7 +5,7 @@
 #include <ctime>
 #include <atomic>
 #include <csignal>
-#include <syncstream>
+// #include <syncstream>
 
 namespace { // anonymous namespace for internal linkage
 
@@ -423,22 +423,40 @@ inline void Logger::_logCommon(const char* file, const char* function, const int
         }
     } else {
         // print to cout if TUI is not active and level is above TRACE
-        if(level != LogLevel::LOG_TRACE){
+        if(level != LogLevel::LOG_TRACE) {
             constexpr std::string_view colorReset = "\033[0m";
-            std::osyncstream synced_cout(std::cout);
-            std::string levelStr;
+            // std::osyncstream synced_cout(std::cout);
+            // std::string levelStr;
 
 
-            if(level != LogLevel::LOG_INFO) {
-                levelStr =  fmt::format("{}{}{}", _logLevelToColor(level), _logLevelToString(level), colorReset);
+            // if(level != LogLevel::LOG_INFO) {
+            //     levelStr =  fmt::format("{}{}{}", _logLevelToColor(level), _logLevelToString(level), colorReset);
+            // } else {
+            //     levelStr = _logLevelToString(level);
+            // }
+
+            // if(taskId){
+            //     synced_cout << fmt::format("{}{} [|] {}\n", levelStr, taskIdentifier, logStr);
+            // } else {
+            //     synced_cout << fmt::format("{}SYSTEM [|] {}\n", levelStr, logStr);
+            // }
+
+            // Identifier: task name/instance if available, otherwise "SYSTEM"
+            std::string_view identifier = taskId ? taskIdentifier : "SYSTEM";
+            if (level != LogLevel::LOG_INFO) {
+                // Colored output for WARNING/ERROR
+                fmt::print("{}{}{} {} [|] {}\n",
+                    _logLevelToColor(level),      // e.g. "\033[38;5;208m" or "\033[31m"
+                    _logLevelToString(level),     // e.g. "WARNING "
+                    colorReset,
+                    identifier,
+                    logStr);
             } else {
-                levelStr = _logLevelToString(level);
-            }
-
-            if(taskId){
-                synced_cout << fmt::format("{}{} [|] {}\n", levelStr, taskIdentifier, logStr);
-            } else {
-                synced_cout << fmt::format("{}SYSTEM [|] {}\n", levelStr, logStr);
+                // No color for INFO
+                fmt::print("{} {} [|] {}\n",
+                    _logLevelToString(level),
+                    identifier,
+                    logStr);
             }
         }
     }

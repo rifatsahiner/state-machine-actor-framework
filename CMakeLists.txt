@@ -30,6 +30,7 @@ set(SOURCES
     ${SRC_DIR}/state_machine.cpp
     ${SRC_DIR}/task.cpp
     ${SRC_DIR}/async_task.cpp
+    ${SRC_DIR}/sync_task.cpp
     ${SRC_DIR}/logger.cpp
     ${SRC_DIR}/flogview.cpp)
 
@@ -264,6 +265,10 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 
 # asserts will be handled (error log or proper handle) in release build
 # reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle
+# set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
+    # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
+    # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek
+# task queue icin moodycamel::ConcurrentQueue dene
 # add fetch and install for asio too
 # make compile options for tui and cli -> "If you split into components (e.g., core, tui), use COMPONENTS in find_package and separate exports"
 # auto install for dependencies is not recommended. so provide an option to install all or just uOS and make just uOS as rcommended option

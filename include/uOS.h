@@ -54,7 +54,7 @@ class FW
 
         // event delivery
         // all post/publish calls consumes event ownership
-        // for better performance consider moving the event on post/publish calls to avoid copying
+        // for better performance consider moving the event pointer on post/publish calls to avoid copying
         static void postEvent(TaskId, std::shared_ptr<const Event>);
         static void publishEvent(std::shared_ptr<const Event>);
 
@@ -78,9 +78,9 @@ class FW
 
         // task related
         static inline std::array<bool, uOS_FW_MAX_TASK_COUNT> _taskIdUsageList;
-        static inline std::unordered_map<TaskId, std::unique_ptr<AsyncTask>> _taskMap;
+        static inline std::unordered_map<TaskId, std::shared_ptr<Task>> _taskMap;
         static inline std::shared_mutex _taskMutex;
-        static inline std::vector<TaskId> _stopList;
+        // static inline std::vector<TaskId> _stopList;
         static inline std::vector<TaskId> _deleteList;
         static inline std::mutex _listMutex;
 
@@ -107,7 +107,7 @@ class FW
         static void _insertTimerQueue(TimerId, uint_fast16_t);
         static TimerId _setupTimedEvent(bool, bool, uint_fast16_t, std::shared_ptr<const Event>&&, TaskId receiverTaskId = 0);
         static void _handleTick(void);
-        static void _handleStopDelete(void);
+        static void _handleDelete(void);
         static void _publishEvent(std::shared_ptr<const Event>&&);
         static void _publishEventCommon(std::shared_ptr<const Event>&&, std::vector<TaskId>&);
         static void _sigintHandler(int signum);
@@ -131,34 +131,40 @@ class FW
         static void subscribe(std::initializer_list<SignalId>, TaskId);
         static void unsubscribe(SignalId, TaskId);
         static void unsubscribe(std::initializer_list<SignalId>, TaskId);
-        static void stop(TaskId);
-        static void delete_(TaskId);
+        // static void stop(TaskId);
+        static void deleteAsyncTask(TaskId);
         static void registerCliMenu(TaskId, std::unique_ptr<cli::Menu>&&);
         // todo: static void registerStaticCliMenu(std::unique_ptr<cli::Menu>&&);
 
         friend class Task;
+        friend class AsyncTask;
 
     public:
         template <class T, class... TaskArgs>
         static TaskId createTask(std::string taskName = "no-name-inst", TaskArgs&&... taskArgs)
         {   
-            static_assert(std::is_base_of_v<AsyncTask, T>);
-            std::lock_guard lock(_taskMutex);
+            decltype(_taskMap)::iterator iter;
 
-            TaskId newTaskId = FW::_getAvailableTaskId();
+            static_assert(std::is_base_of_v<Task, T>);
+
+            {
+                std::lock_guard lock(_taskMutex);
+                bool result;
+
+                TaskId newTaskId = FW::_getAvailableTaskId();
+
+                std::tie(iter, result) = _taskMap.try_emplace(newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
+                assert(result == true);
+            }
             
-            const auto [iter, result] = _taskMap.try_emplace(newTaskId, std::make_unique<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
-            assert(result == true);
-
             iter->second->init();   // see function body for explanation
 
-            return newTaskId;
+            return iter->first;
         }
 };
 
 // log view finalize
 // cmake with examples (add final, fmt, etc. as modules)
-// todo: address sanitizer ekelencek
 
 // bitset kullanılabilecek yerler var mı?
 // custom objelerin operatörlerini overload edebileceğimiz durumlar var mı(bool, &&, >, < vs.)

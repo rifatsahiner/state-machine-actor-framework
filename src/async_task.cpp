@@ -5,6 +5,15 @@
 namespace uOS {
 
 
+AsyncTask::~AsyncTask() {
+    if(_taskThead.joinable()) {
+        LOG(LogLevel::LOG_ERROR, "Async task destructor called while task thread is still joinable");
+        _isRunning.store(false, std::memory_order_relaxed);
+        _taskCv.notify_one();
+        _taskThead.join();
+    }
+}
+
 void AsyncTask::putEvent(std::shared_ptr<const Event>&& newEvent)
 {    
     // lock the queue
@@ -28,8 +37,8 @@ bool AsyncTask::isIdle(void) {
 void AsyncTask::stop(bool waitJoin) 
 {    
     {
-        std::lock_guard<std::mutex> lock(_threadMutex);
-        _isRunning = false;
+        // std::lock_guard<std::mutex> lock(_threadMutex);
+        _isRunning.store(false, std::memory_order_relaxed);
         _taskCv.notify_one();  // Wake if waiting (predicate will see !_isRunning)
     }
 
@@ -46,7 +55,7 @@ void AsyncTask::stop(bool waitJoin)
 }
 
 void AsyncTask::resume(bool cleanStart) {
-    if(_isRunning == false)
+    if(_isRunning.load(std::memory_order_relaxed) == false)
     {
         if(cleanStart == true) {
             // clear event queue
@@ -55,7 +64,7 @@ void AsyncTask::resume(bool cleanStart) {
             std::swap(_eventQueue, empty);
         }
 
-        _isRunning = true;
+        _isRunning.store(true, std::memory_order_relaxed);
         _taskThead = std::thread {&AsyncTask::_taskLoop, this};
 
         std::ostringstream oss;
@@ -72,11 +81,11 @@ void AsyncTask::_taskLoop(void)
 
     while (true) {
         // Wait while empty and running (atomic under mutex)
-        while (_eventQueue.empty() && _isRunning) {
+        while (_eventQueue.empty() && _isRunning.load(std::memory_order_relaxed)) {
             _taskCv.wait(threadLock);
         }
 
-        if (!_isRunning) {
+        if (!_isRunning.load(std::memory_order_relaxed)) {
             break;
         }
 
@@ -103,6 +112,10 @@ void AsyncTask::_taskLoop(void)
     threadLock.unlock();
     LOG(LogLevel::LOG_INFO, "Task thread loop exit");
 }
+
+void AsyncTask::_selfStop(void) { FW::stopTask(_id, false); }
+
+void AsyncTask::_selfDelete(void) { FW::deleteAsyncTask(_id); }
 
 
 }    // namespace uOS

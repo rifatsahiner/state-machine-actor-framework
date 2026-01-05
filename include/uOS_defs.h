@@ -5,8 +5,8 @@
 #include <optional>
 #include <memory>
 
-static constexpr uint_fast16_t uOS_FW_MAX_TASK_COUNT = 512; 
-static constexpr uint_fast16_t uOS_FW_MAX_TIMER_COUNT = 2048;
+#define uOS_FW_MAX_TASK_COUNT 512
+#define uOS_FW_MAX_TIMER_COUNT 2048
 
 
 namespace uOS {

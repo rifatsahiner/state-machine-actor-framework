@@ -5,6 +5,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <atomic>
+#include <string_view>
 
 #include "state_machine.h"
 #include "detail/logger.h"
@@ -26,6 +28,10 @@ class Task : public StateMachine
         virtual void stop(bool waitJoin = true) = 0;
         virtual void resume(bool cleanStart = true) = 0;
         virtual void putEvent(std::shared_ptr<const Event>&&) = 0;
+
+        enum class Type {Sync, Async};
+
+        virtual Type getType(void) const = 0;
         std::string getName(void) const;
         std::string_view getState(void) const;
 #ifndef NDEBUG
@@ -55,13 +61,13 @@ class Task : public StateMachine
         void _selfPost(std::shared_ptr<const Event>);
         TimerId _selfPostIn(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
         TimerId _selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
-        void _selfStop(void);
-        void _selfDelete(void);
+        virtual void _selfStop(void) = 0;
+        virtual void _selfDelete(void) = 0;
         void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 
         const TaskId _id;
         std::queue<std::shared_ptr<const Event>> _eventQueue;
-        bool _isRunning = false;
+        std::atomic<bool> _isRunning {false};
         
         template <class T = Event>
         std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
@@ -96,12 +102,18 @@ class AsyncTask : public Task
         void stop(bool waitJoin = true) override;
         void resume(bool cleanStart = true) override;
         void putEvent(std::shared_ptr<const Event>&& event) override;
+        Type getType() const override { return Type::Async; }
 #ifndef NDEBUG
         bool isIdle(void) override;
 #endif
 
+        ~AsyncTask();
+
     protected:
         using Task::Task;   // inherit constructor
+
+        void _selfStop(void) override;
+        void _selfDelete(void) override;
 
     private:
         std::thread _taskThead;
@@ -112,6 +124,28 @@ class AsyncTask : public Task
 #endif
 
         void _taskLoop(void);
+};
+
+class SyncTask : public Task
+{
+    public:
+        void stop(bool waitJoin = true) override;
+        void resume(bool cleanStart = true) override;
+        void putEvent(std::shared_ptr<const Event>&& event) override;
+        void runCycle(void);
+        Type getType() const override { return Type::Sync; }
+#ifndef NDEBUG
+        bool isIdle(void) override;
+#endif
+
+    protected:
+        using Task::Task;
+
+        void _selfStop(void) override;
+        void _selfDelete(void) override;
+
+    private:
+        std::mutex _queueMutex;
 };
 
 
