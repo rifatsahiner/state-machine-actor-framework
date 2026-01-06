@@ -5,8 +5,8 @@
 #include <optional>
 #include <memory>
 
-#define uOS_FW_MAX_TASK_COUNT 512
-#define uOS_FW_MAX_TIMER_COUNT 2048
+#define uOS_FW_MAX_TASK_COUNT 1024
+#define uOS_FW_MAX_TIMER_COUNT 4096
 
 
 namespace uOS {
@@ -22,6 +22,7 @@ using TimerId = uint_fast16_t;
 // taskId
 #if uOS_FW_MAX_TASK_COUNT > 256
 using TaskId = uint_fast16_t;
+#define uOS_FW_SYNC_TASK_THREAD_POOL_SIZE 8
 #else
 using TaskId = uint_fast8_t;
 #endif

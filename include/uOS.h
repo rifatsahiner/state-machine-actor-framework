@@ -79,8 +79,8 @@ class FW
         // task related
         static inline std::array<bool, uOS_FW_MAX_TASK_COUNT> _taskIdUsageList;
         static inline std::unordered_map<TaskId, std::shared_ptr<Task>> _taskMap;
+        static inline std::vector<std::shared_ptr<SyncTask>> _syncTaskList;
         static inline std::shared_mutex _taskMutex;
-        // static inline std::vector<TaskId> _stopList;
         static inline std::vector<TaskId> _deleteList;
         static inline std::mutex _listMutex;
 
@@ -155,6 +155,9 @@ class FW
 
                 std::tie(iter, result) = _taskMap.try_emplace(newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
                 assert(result == true);
+                if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(iter->second)) {
+                    _syncTaskList.push_back(std::move(syncTaskPtr));
+                }
             }
             
             iter->second->init();   // see function body for explanation
@@ -162,12 +165,6 @@ class FW
             return iter->first;
         }
 };
-
-// log view finalize
-// cmake with examples (add final, fmt, etc. as modules)
-
-// bitset kullanılabilecek yerler var mı?
-// custom objelerin operatörlerini overload edebileceğimiz durumlar var mı(bool, &&, >, < vs.)
 
 
 }   // namespace uOS

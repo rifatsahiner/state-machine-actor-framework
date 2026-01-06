@@ -264,10 +264,12 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 
 
 # asserts will be handled (error log or proper handle) in release build
+# tum loglama isini spdlog'a cevir
 # reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle
 # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
     # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
     # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek
+# bir klasorde 10k yada 20k dan fazla log dosyası olmasını engelle, 33k dosya varken bu sekilde bir hata aldim
 # task queue icin moodycamel::ConcurrentQueue dene
 # add fetch and install for asio too
 # make compile options for tui and cli -> "If you split into components (e.g., core, tui), use COMPONENTS in find_package and separate exports"
@@ -277,3 +279,5 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 # option(uOS_MODULE "Build a module instead of a traditional library." OFF) --> bunu ekle ve node.js tarzı module yap (örneği FMT'den çaldım)
 # add tests
 # add examples
+# log view finalize
+# cmake with examples (add final, fmt, etc. as modules)

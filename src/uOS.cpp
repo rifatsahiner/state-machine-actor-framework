@@ -34,7 +34,10 @@ void FW::init(int argc, char* argv[], const std::string& appName){
     _taskIdUsageList.fill(false);
     _timerIdUsageList.fill(false);
     _taskMap.clear();
+    _syncTaskList.clear();
+    _syncTaskList.reserve(uOS_FW_MAX_TASK_COUNT);
     _subsMap.clear();
+    _deleteList.clear();
     
     _isRunning = true;
 
@@ -129,6 +132,8 @@ int32_t FW::run() {
     uint_fast8_t m = 0;
     uint_fast8_t h = 0;
     std::chrono::milliseconds::rep maxLoopDuration = 0;
+    uint_fast32_t loopOverrunCount = 0;
+    std::vector<std::shared_ptr<uOS::SyncTask>> syncTaskListCopy {};
 
     // onStartup() aşağıdaki satırlar
     // struct termios tio;                        // modified terminal attributes
@@ -143,76 +148,107 @@ int32_t FW::run() {
     // sparam.sched_priority = sched_get_priority_max(SCHED_FIFO);
     // pthread_setschedparam(pthread_self(), SCHED_FIFO, &sparam) == 0;  
 
+#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
+    // setup sync task thread pool    
+    std::atomic<uint_fast8_t> activeThreadsNeeded{0};
+    std::atomic<uint_fast8_t> threadsFinished{0};
+    std::atomic<bool> poolRunning{true};
+    std::atomic<uint_fast64_t> currentWorkCycle{0};
+
+    std::mutex poolMutex;
+    std::condition_variable cvStart;
+    std::condition_variable cvDone;
+
+    auto syncTaskProcessWorker = [&](int threadId) {
+        uint64_t lastProcessedCycle = 0; // Local to each thread
+
+        while (poolRunning) {
+            std::unique_lock<std::mutex> lock(poolMutex);
+            // Wait until pool stops OR a NEW cycle has started for this thread
+            cvStart.wait(lock, [&] { 
+                return !poolRunning || 
+                       (currentWorkCycle > lastProcessedCycle && threadId < activeThreadsNeeded); 
+            });
+
+            if (!poolRunning) return;
+            
+            // Mark this cycle as "in progress" for this thread
+            lastProcessedCycle = currentWorkCycle;
+            lock.unlock();
+
+            // --- STATIC PARTITIONING LOGIC ---
+            size_t totalTasks = syncTaskListCopy.size();
+            int nThreads = activeThreadsNeeded;
+
+            size_t tasksPerThread = totalTasks / nThreads;
+            size_t remainder = totalTasks % nThreads;
+
+            size_t start = threadId * tasksPerThread + std::min((size_t)threadId, remainder);
+            size_t end = start + tasksPerThread + (static_cast<size_t>(threadId) < remainder ? 1 : 0);
+
+            for (size_t i = start; i < end; ++i) {
+                syncTaskListCopy[i]->runCycle();
+            }
+
+            // Atomically check-in
+            if (++threadsFinished == nThreads) {
+                cvDone.notify_one();
+            }
+        }
+    };
+
+    std::vector<std::thread> threadPool;
+    for (size_t i = 0; i < uOS_FW_SYNC_TASK_THREAD_POOL_SIZE; ++i) {
+        threadPool.emplace_back(syncTaskProcessWorker, i);
+    }
+#endif
+
     // start logger
     Logger::start();
     LOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
     LOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
 
-    // get the start time
+    // reserve sync task copy buffer and get the start time
+    syncTaskListCopy.reserve(uOS_FW_MAX_TASK_COUNT);
     auto wakeup = std::chrono::steady_clock::now();
 
+    //
+    // main framework loop
+    //
     while(_isRunning) {
         // handle sync tasks
-        // // make a copy of sync task pointers to avoid holding lock during runCycle calls
-        // std::shared_lock syncTaskCopyLock(_taskMutex);
-        // auto syncTaskListCopy = _syncTaskList;
-        // syncTaskCopyLock.unlock();
-        // for(const auto& syncTaskPtr : syncTaskListCopy){
-        //     syncTaskPtr->runCycle();
-        // }
+        {
+            std::shared_lock lock(_taskMutex);
+            syncTaskListCopy = _syncTaskList; 
+        } 
 
-        for(uint_fast16_t i = 0; i < uOS_FW_MAX_TASK_COUNT; ++i){
-            std::shared_lock readlock(_taskMutex);
-            if(_taskIdUsageList[i]){
-                auto taskIter = _taskMap.find(static_cast<TaskId>(i));
-                assert(taskIter != _taskMap.cend());
-
-                // check if task is sync task
-                if(taskIter->second->getType() == Task::Type::Sync){
-                    // get ptr copy and release lock
-                    auto syncTaskPtr = std::static_pointer_cast<SyncTask>(taskIter->second);
-                    readlock.unlock();
-
+        if (!syncTaskListCopy.empty()) {
+            if (syncTaskListCopy.size() < 256) {
+                // Direct execution for small number of sync tasks
+                for(const auto& syncTaskPtr : syncTaskListCopy){
                     syncTaskPtr->runCycle();
                 }
             }
-        }
+#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
+            else {
+                // Use thread pool for large number of sync tasks
+                threadsFinished = 0;
+            
+                // Ensure calculation doesn't exceed pool size
+                activeThreadsNeeded = std::min((int)uOS_FW_SYNC_TASK_THREAD_POOL_SIZE, (int)(syncTaskListCopy.size() / 256) + 1);
 
-        // std::array<std::thread, 3> threadPool;
-        // for(std::size_t threadCounter = 0; threadCounter < 3; ++threadCounter) {
-        //     threadPool[threadCounter] = std::thread([threadCounter]() {
-        //         for (std::size_t i = threadCounter; i < uOS_FW_MAX_TASK_COUNT; i += 3) {
-        //             std::shared_lock readlock(_taskMutex);
-        //             if(_taskIdUsageList[i]){
-        //                 auto taskIter = _taskMap.find(static_cast<TaskId>(i));
-        //                 assert(taskIter != _taskMap.cend());
+                currentWorkCycle++;
+                cvStart.notify_all();
 
-        //                 // check if task is sync task
-        //                 if(taskIter->second->getType() == Task::Type::Sync){
-        //                     // get ptr copy and release lock
-        //                     auto syncTaskPtr = std::static_pointer_cast<SyncTask>(taskIter->second);
-        //                     readlock.unlock();
-
-        //                     syncTaskPtr->runCycle();
-        //                 }
-        //             }
-        //         }
-        //     });
-        // }
-        // for (auto& t : threadPool) {
-        //     if (t.joinable()) {
-        //         t.join();
-        //     }
-        // }
-#ifndef NDEBUG
-        auto durationAfterSyncTasks = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
+                std::unique_lock<std::mutex> lock(poolMutex);
+                cvDone.wait(lock, [&] { return threadsFinished == activeThreadsNeeded; });
+            }
 #endif
+            syncTaskListCopy.clear(); 
+        }
 
         // handle timers
         _handleTick();
-#ifndef NDEBUG
-        auto durationAfterTick = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
-#endif
 
         // handle time events
         // check for second
@@ -232,26 +268,23 @@ int32_t FW::run() {
                 }
             }
         }
-#ifndef NDEBUG
-        auto durationAfterPublish = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
-#endif
 
         // handle cli
         if(_cli){
             _cliScheduler->PollOne();
         }
 
-        // handle self stop and self delete request from tasks
+        // handle self delete request from tasks
         _handleDelete();
 
+        // handle loop duration stats
         auto loopDuration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wakeup).count();
         if(maxLoopDuration < loopDuration){
             maxLoopDuration = loopDuration;
-#ifndef NDEBUG
-            LOG(uOS::LogLevel::LOG_WARNING, "New max loop duration: {} ms. after publish: {}, after sync tasks: {}, after tick: {} ms", maxLoopDuration, durationAfterPublish, durationAfterSyncTasks, durationAfterTick);
-#else
-            LOG(uOS::LogLevel::LOG_WARNING, "New max loop duration: {} ms.", maxLoopDuration);            
-#endif
+        }
+        if(loopDuration > 18){
+            loopOverrunCount++;
+            LOG(uOS::LogLevel::LOG_WARNING, "Loop overruned {} th time with {} ms. Max loop duration: {} ms.", loopOverrunCount, loopDuration, maxLoopDuration);
         }
 
         // sleep_remaining of 20ms loop period
@@ -259,7 +292,14 @@ int32_t FW::run() {
         std::this_thread::sleep_until(wakeup);
     }
 
-    // terminate all task threads
+#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE    
+    // sync task thread pool cleanup
+    poolRunning = false;
+    cvStart.notify_all();
+    for (auto& t : threadPool) t.join();
+#endif
+
+    // terminate all task loops
     LOG(uOS::LogLevel::LOG_INFO, "FW run loop exit. Stopping all tasks");
     std::shared_lock readlock(_taskMutex);
     for(const auto& taskPair : _taskMap) {
@@ -351,12 +391,12 @@ void FW::deleteTask(TaskId taskId){
         std::string taskName = taskIter->second->getName();
 
         // delete from map, make its taskId available and remove from sync task list if necessary
-        // if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
-        //     auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTaskPtr);
-        //     if(syncTaskIt != _syncTaskList.end()){
-        //         _syncTaskList.erase(syncTaskIt);
-        //     }
-        // }
+        if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
+            auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTaskPtr);
+            if(syncTaskIt != _syncTaskList.end()){
+                _syncTaskList.erase(syncTaskIt);
+            }
+        }
         assert(_taskMap.erase(taskId) == 1);
         _taskIdUsageList[taskId] = false;
 
@@ -615,12 +655,12 @@ void FW::_publishEventCommon(std::shared_ptr<const Event>&& event, std::vector<T
 }
 
 TaskId FW::_getAvailableTaskId(void){
-    TaskId i;
+    uint_fast16_t i;
     
     for(i = 0; i < uOS_FW_MAX_TASK_COUNT; i++){
         if(_taskIdUsageList[i] == false){
             _taskIdUsageList[i] = true;
-            return i;
+            return static_cast<TaskId>(i);
         }
     }
 

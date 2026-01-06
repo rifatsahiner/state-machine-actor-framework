@@ -28,10 +28,6 @@ class Task : public StateMachine
         virtual void stop(bool waitJoin = true) = 0;
         virtual void resume(bool cleanStart = true) = 0;
         virtual void putEvent(std::shared_ptr<const Event>&&) = 0;
-
-        enum class Type {Sync, Async};
-
-        virtual Type getType(void) const = 0;
         std::string getName(void) const;
         std::string_view getState(void) const;
 #ifndef NDEBUG
@@ -102,7 +98,6 @@ class AsyncTask : public Task
         void stop(bool waitJoin = true) override;
         void resume(bool cleanStart = true) override;
         void putEvent(std::shared_ptr<const Event>&& event) override;
-        Type getType() const override { return Type::Async; }
 #ifndef NDEBUG
         bool isIdle(void) override;
 #endif
@@ -133,7 +128,6 @@ class SyncTask : public Task
         void resume(bool cleanStart = true) override;
         void putEvent(std::shared_ptr<const Event>&& event) override;
         void runCycle(void);
-        Type getType() const override { return Type::Sync; }
 #ifndef NDEBUG
         bool isIdle(void) override;
 #endif

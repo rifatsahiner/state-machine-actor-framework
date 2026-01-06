@@ -96,10 +96,6 @@ TimerId Task::_selfPostIn(uint_fast16_t intervalMs, std::shared_ptr<const Event>
 
 TimerId Task::_selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event> event) { return FW::postEventEvery(intervalMs, _id, std::move(event)); }
 
-// void Task::_selfStop(void) { FW::stop(_id); }
-
-// void Task::_selfDelete(void) { FW::delete_(_id); }
-
 void Task::_registerCliMenu(std::unique_ptr<cli::Menu>&& menuPtr) { FW::registerCliMenu(_id, std::move(menuPtr)); }
 
 
