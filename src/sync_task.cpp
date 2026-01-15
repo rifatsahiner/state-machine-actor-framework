@@ -37,6 +37,8 @@ void SyncTask::resume(bool cleanStart) {
 
         _isRunning.store(true, std::memory_order_relaxed);
         LOG(LogLevel::LOG_INFO, "Task started/resumed");
+    } else {
+        LOG(LogLevel::LOG_ERROR, "Resume called for already running task");
     }
 }
 

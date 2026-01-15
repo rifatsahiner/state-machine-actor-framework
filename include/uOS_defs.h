@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <memory>
+#include <cassert>
 
 #define uOS_FW_MAX_TASK_COUNT 1024
 #define uOS_FW_MAX_TIMER_COUNT 4096
@@ -66,7 +67,8 @@ std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
 template <class T>
 const T& recast_e(const Event& eventRef) {
     static_assert(std::is_base_of_v<Event, T>);
-#ifndef NDEBUG  // Debug mode: Exact runtime type check
+#ifndef NDEBUG
+    // exact runtime type check in debug mode
     if (typeid(eventRef) != typeid(T)) {
         throw std::runtime_error("Type mismatch in recast_e: Expected exactly " + 
                                  std::string(typeid(T).name()) + 
@@ -86,6 +88,30 @@ enum class LogLevel : uint_fast8_t {
 
 // log macro
 #define LOG(logLevel, logStr, ...) log__(__FILE__, __func__, __LINE__, logLevel, logStr, ##__VA_ARGS__)
+
+// define the unreachable intrinsic based on compiler
+#if defined(_MSC_VER)
+    #define FW_UNREACHABLE() __assume(0)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define FW_UNREACHABLE() __builtin_unreachable()
+#else
+    #define FW_UNREACHABLE()
+#endif
+
+// custom assert for fatal errors that uses regulear assert in debug mode and aborts in release mode
+#ifdef NDEBUG
+    // Release Build: Abort and hint to the compiler that this is unreachable
+    #define ASSERT_FOR_FATAL(expr) \
+        do {                             \
+            if (!(expr)) {               \
+                std::abort();            \
+                FW_UNREACHABLE();        \
+            }                            \
+        } while (0)
+#else
+    // Debug Build: Use standard assert for breakpoints
+    #define ASSERT_FOR_FATAL(expr) assert(expr)
+#endif
 
 
 }   // namespace uOS

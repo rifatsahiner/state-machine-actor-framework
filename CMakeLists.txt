@@ -263,9 +263,8 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 
 
 
-# asserts will be handled (error log or proper handle) in release build
 # tum loglama isini spdlog'a cevir
-# reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle
+# reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle -> spdlog'a yaptir
 # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
     # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
     # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek

@@ -333,7 +333,7 @@ void FW::kill(void){
 void FW::startTask(TaskId taskId){ 
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
     LOG(LogLevel::LOG_INFO, "Starting task with id: {}", taskId);
     taskIter->second->start();
@@ -342,7 +342,7 @@ void FW::startTask(TaskId taskId){
 void FW::stopTask(TaskId taskId, bool waitShutdown){
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
     LOG(LogLevel::LOG_INFO, "Stoping task with id: {}", taskId);
     taskIter->second->stop(waitShutdown);
@@ -351,7 +351,7 @@ void FW::stopTask(TaskId taskId, bool waitShutdown){
 std::string_view FW::getTaskState(TaskId taskId){
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
     return taskIter->second->getState();
 }
@@ -359,7 +359,7 @@ std::string_view FW::getTaskState(TaskId taskId){
 bool FW::isTaskIdle(TaskId taskId){
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 #ifndef NDEBUG
     return taskIter->second->isIdle();
 #else
@@ -370,7 +370,7 @@ bool FW::isTaskIdle(TaskId taskId){
 void FW::resumeTask(TaskId taskId, bool cleanStart){
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
     LOG(LogLevel::LOG_INFO, "Resuming task with id: {}", taskId);
     taskIter->second->resume(cleanStart);
@@ -385,7 +385,7 @@ void FW::deleteTask(TaskId taskId){
     {
         std::lock_guard taskLock(_taskMutex);
         auto taskIter = _taskMap.find(taskId);
-        assert(taskIter != _taskMap.cend());
+        ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
         
         // get task name before deletion
         std::string taskName = taskIter->second->getName();
@@ -393,18 +393,17 @@ void FW::deleteTask(TaskId taskId){
         // delete from map, make its taskId available and remove from sync task list if necessary
         if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
             auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTaskPtr);
-            if(syncTaskIt != _syncTaskList.end()){
-                _syncTaskList.erase(syncTaskIt);
-            }
+            ASSERT_FOR_FATAL(syncTaskIt != _syncTaskList.end());
+            _syncTaskList.erase(syncTaskIt);
         }
-        assert(_taskMap.erase(taskId) == 1);
+        ASSERT_FOR_FATAL(_taskMap.erase(taskId) == 1);
         _taskIdUsageList[taskId] = false;
 
 
         // remove its cli menu if necessary
         if(_cli){
             // check if it was last task of its kind
-            if(std::ranges::none_of(_taskMap, [name = std::string_view(taskName)](const auto& pair) { return pair.second->getName() == name; })){
+            if(std::none_of(_taskMap.cbegin(), _taskMap.cend(), [name = std::string_view(taskName)](const auto& pair) { return pair.second->getName() == name; })){
                 // post to cli scheduler for thread safety
                 _cliScheduler->Post([taskName = std::move(taskName)]() {
                     // if there is a menu for this task, remove it
@@ -434,14 +433,14 @@ void FW::deleteTask(TaskId taskId){
 void FW::postEvent(TaskId taskId, std::shared_ptr<const Event> event){
     std::shared_lock lock(_taskMutex);
     auto taskIter = _taskMap.find(taskId);
-    assert(taskIter != _taskMap.cend());
+    ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
     taskIter->second->putEvent(std::move(event));
 }
 
 TimerId FW::postEventIn(uint_fast16_t intervalMs, TaskId taskId, std::shared_ptr<const Event> event) {
     std::shared_lock lock(_taskMutex);
-    assert(_taskMap.find(taskId) != _taskMap.cend());
+    ASSERT_FOR_FATAL(_taskMap.find(taskId) != _taskMap.cend());
     lock.unlock();
     
     // call common function for new timer creation
@@ -450,7 +449,7 @@ TimerId FW::postEventIn(uint_fast16_t intervalMs, TaskId taskId, std::shared_ptr
 
 TimerId FW::postEventEvery(uint_fast16_t intervalMs, TaskId taskId, std::shared_ptr<const Event> event) {
     std::shared_lock lock(_taskMutex);
-    assert(_taskMap.find(taskId) != _taskMap.cend());
+    ASSERT_FOR_FATAL(_taskMap.find(taskId) != _taskMap.cend());
     lock.unlock();
 
     return _setupTimedEvent(false, true, intervalMs / 20, std::move(event), taskId);
@@ -507,7 +506,9 @@ void FW::cancelTimedEvent(TimerId timerId){
                 itPrev = itCancel;    
         }
 
-        assert(false);
+        ASSERT_FOR_FATAL(false);
+    } else {
+        LOG(LogLevel::LOG_WARNING, "Timer Id: {} not found or already expired for cancel operation", timerId);
     }
 }
 
@@ -530,7 +531,7 @@ void FW::subscribe(SignalId signalId, TaskId subsId)
         std::vector<TaskId>& subsList = signalSubsListIter->second;
 
         // assert if subs is already on the list
-        assert(std::find(subsList.begin(), subsList.end(), subsId) == subsList.end());
+        ASSERT_FOR_FATAL(std::find(subsList.begin(), subsList.end(), subsId) == subsList.end());
 
         // add task to the list as a new subs
         subsList.push_back(subsId);
@@ -553,12 +554,12 @@ void FW::unsubscribe(SignalId signalId, TaskId subsId)
 
     // get signal's subs list, assert if signal id does not have subs list
     auto signalSubsListIter = _subsMap.find(signalId);
-    assert(signalSubsListIter != _subsMap.cend());
+    ASSERT_FOR_FATAL(signalSubsListIter != _subsMap.cend());
 
     // get iterator for subsId, assert if subsId is not present
     std::vector<TaskId>& subsList = signalSubsListIter->second;
     auto subsIdIter = std::find(subsList.cbegin(), subsList.cend(), subsId);
-    assert(subsIdIter != subsList.cend());
+    ASSERT_FOR_FATAL(subsIdIter != subsList.cend());
 
     // remove subsId from list
     subsList.erase(subsIdIter);
@@ -664,7 +665,7 @@ TaskId FW::_getAvailableTaskId(void){
         }
     }
 
-    assert(false);
+    ASSERT_FOR_FATAL(false);
 }
 
 TimerId FW::_getAvailableTimerId(void){
@@ -689,7 +690,7 @@ TimerId FW::_getAvailableTimerId(void){
         }
     }
     
-    assert(false);
+    ASSERT_FOR_FATAL(false);
 }
 
 void FW::_insertTimerQueue(TimerId timerId, uint_fast16_t interval)

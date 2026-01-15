@@ -1,7 +1,6 @@
 #ifndef uOS_H
 #define uOS_H
 
-#include <cassert>
 #include <type_traits>
 
 #include <utility>
@@ -46,9 +45,9 @@ class FW
 
         // task op
         static void startTask(TaskId);
-        static void stopTask(TaskId, bool waitShutdown = true);     // do not call from state-handler for its own task
+        static void stopTask(TaskId, bool waitShutdown = true);
         static void resumeTask(TaskId, bool cleanStart);
-        static void deleteTask(TaskId);                             // do not call from state-handler for its own task
+        static void deleteTask(TaskId);     // do not call from state-handler for its own task
         static std::string_view getTaskState(TaskId taskId);
         static bool isTaskIdle(TaskId taskId);
 
@@ -131,7 +130,6 @@ class FW
         static void subscribe(std::initializer_list<SignalId>, TaskId);
         static void unsubscribe(SignalId, TaskId);
         static void unsubscribe(std::initializer_list<SignalId>, TaskId);
-        // static void stop(TaskId);
         static void deleteAsyncTask(TaskId);
         static void registerCliMenu(TaskId, std::unique_ptr<cli::Menu>&&);
         // todo: static void registerStaticCliMenu(std::unique_ptr<cli::Menu>&&);
@@ -154,7 +152,7 @@ class FW
                 TaskId newTaskId = FW::_getAvailableTaskId();
 
                 std::tie(iter, result) = _taskMap.try_emplace(newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
-                assert(result == true);
+                ASSERT_FOR_FATAL(result == true);
                 if(auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(iter->second)) {
                     _syncTaskList.push_back(std::move(syncTaskPtr));
                 }

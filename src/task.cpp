@@ -1,6 +1,4 @@
 
-#include <cassert>
-
 #include "uOS.h"
 
 
@@ -28,10 +26,12 @@ void Task::init(void){
 
 void Task::start(void)
 {
-    assert(_isRunning.load(std::memory_order_relaxed) == false);
-
-    StateMachine::init();
-    resume(true);
+    if(_isRunning.load(std::memory_order_relaxed) == false){
+        StateMachine::init();
+        resume(true);
+    } else {
+        LOG(LogLevel::LOG_ERROR, "Start task function called for already running task instance {}", _instName);
+    }
 }
 
 std::string Task::getName(void) const {
@@ -47,7 +47,7 @@ std::string_view Task::getState(void) const
         }
     }
     
-    assert(false);
+    ASSERT_FOR_FATAL(false);
 }
 
 void Task::cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::json& json, std::optional<TaskId> sourceTaskId) {

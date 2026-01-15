@@ -124,7 +124,7 @@ void _folderSizer(std::filesystem::path folderPath){
         // remove the oldest file
         LOG(uOS::LogLevel::LOG_INFO, "Log size in folder: {} is {} bytes. Deleting oldest log file: {}", folderPath.filename().string(), totalSize, oldestFile->filename().string());
         if(std::filesystem::remove(*oldestFile) == false) {
-            assert(false);
+            ASSERT_FOR_FATAL(false);
         }
     } else {
         LOG(uOS::LogLevel::LOG_TRACE, "Log size in folder: {} is {} bytes", folderPath.filename().string(), totalSize);
@@ -174,7 +174,7 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
     // get binary path in buffer
     char buffer[1024];
     ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-    assert(len != -1);
+    ASSERT_FOR_FATAL(len != -1);
     buffer[len] = '\0';
 
     // create LOGS folder if necessary
@@ -183,7 +183,7 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
         if (std::filesystem::create_directory(_logFolderPath)) {
             logsCreated = true;
         } else {
-            assert(false);
+            ASSERT_FOR_FATAL(false);
         }
     }
     
@@ -193,7 +193,7 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
         if (std::filesystem::create_directory(systemFolderPath)) {
             systemCreated = true;
         } else {
-            assert(false);
+            ASSERT_FOR_FATAL(false);
         }
     }
 
@@ -209,7 +209,7 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
                     << std::setw(2) << std::setfill('0') << timeStruct->tm_sec;
     
     std::ofstream systemFile(systemFolderPath / (fileNameStream.str() + ".log"));
-    assert(systemFile.is_open());
+    ASSERT_FOR_FATAL(systemFile.is_open());
 
     // add to system file
     _systemFile = std::make_unique<TaskLogStream>(std::move(systemFile), std::move(systemFolderPath), fileNameStream.str());
@@ -277,7 +277,7 @@ void Logger::addTaskLogger(const TaskId taskId, const std::string& taskName, con
         if (std::filesystem::create_directory(taskFolderPath)) {
             LOG(LogLevel::LOG_INFO, "Task log folder created: {}", taskFolderPath.filename().string());
         } else {
-            assert(false);
+            ASSERT_FOR_FATAL(false);
         }
     }
 
@@ -314,14 +314,14 @@ void Logger::addTaskLogger(const TaskId taskId, const std::string& taskName, con
     
     // Check if file was opened successfully
     if (!taskfile.is_open()) {
-        assert(false);
+        ASSERT_FOR_FATAL(false);
     }
 
     // add to task file map
     {
         std::lock_guard lock(_taskFileMapMutex);
         auto [iter, result] = _taskFileMap.try_emplace(taskId, std::move(taskfile), std::move(taskFolderPath), std::move(fileName));
-        assert(result);
+        ASSERT_FOR_FATAL(result);
     }
     LOG(LogLevel::LOG_INFO, "Log file created for instance: {} of type: {}", instName, taskName);
     
@@ -336,7 +336,7 @@ void Logger::removeTaskLogger(const TaskId taskId) {
     {
         std::lock_guard lock(_taskFileMapMutex);
         auto iter = _taskFileMap.find(taskId);
-        assert(iter != _taskFileMap.end());
+        ASSERT_FOR_FATAL(iter != _taskFileMap.end());
         iter->second.fileStream.close();
         _taskFileMap.erase(iter);
     }
@@ -400,7 +400,7 @@ inline void Logger::_logCommon(const char* file, const char* function, const int
         if(taskId){
             std::shared_lock taskFileMapLock(_taskFileMapMutex);
             auto iter = _taskFileMap.find(taskId.value());
-            assert(iter != _taskFileMap.end());
+            ASSERT_FOR_FATAL(iter != _taskFileMap.end());
             std::lock_guard<std::mutex> fileLock(iter->second.fileMutex);
             iter->second.fileStream << _logLevelToString(level) << logLine << '\n';
             _fileSizer(iter->second);
@@ -457,7 +457,7 @@ inline void Logger::_fileSizer(TaskLogStream& logStream) {
         _folderSizer(logStream.folderPath);
         logStream.fileStream.open(logStream.folderPath / (logStream.fileName + '_' + std::to_string(logStream.overflowCount) + ".log"));
         if (logStream.fileStream.is_open() == false) {
-            assert(false);
+            ASSERT_FOR_FATAL(false);
         }
     }
 }

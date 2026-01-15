@@ -70,6 +70,8 @@ void AsyncTask::resume(bool cleanStart) {
         std::ostringstream oss;
         oss << _taskThead.get_id();  // thread id is not formatable, so use ostringstream
         LOG(LogLevel::LOG_INFO, "Task started with thread id: {}", oss.str());
+    } else {
+        LOG(LogLevel::LOG_ERROR, "Resume called for already running task");
     }
 }
 

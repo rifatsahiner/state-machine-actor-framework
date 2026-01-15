@@ -1,10 +1,8 @@
 
 #include <vector>
-#include <cassert>
 #include <algorithm>
 
 #include "state_machine.h"
-// #include "detail/logger.h"
 
 
 namespace uOS {
@@ -30,12 +28,12 @@ void StateMachine::init(void)
     HandleResult res;
 
     // check if current state is abs-top
-    assert(_currentState == &StateMachine::top);
+    ASSERT_FOR_FATAL(_currentState == &StateMachine::top);
 
     // call initial top transition 
     // assert if transition is not provided
     res = _topInitialTrans();
-    assert(res == HandleResult::Trans);
+    ASSERT_FOR_FATAL(res == HandleResult::Trans);
 
     // process initial transition
     _currentState = _procInitTrans();
@@ -48,7 +46,7 @@ void StateMachine::dispatch(const Event& event)
     HandleResult res;
 
     // check state integrity
-    assert(_currentState == _tempTargetState);
+    ASSERT_FOR_FATAL(_currentState == _tempTargetState);
 
     // pass event up throgh the hierarchy until handled or ignored by top
     do {
@@ -198,7 +196,7 @@ void StateMachine::dispatch(const Event& event)
 bool StateMachine::isIn(const State state)
 {
     // check state integrity
-    assert(_currentState == _tempTargetState);
+    ASSERT_FOR_FATAL(_currentState == _tempTargetState);
 
     bool isIn = false;
 

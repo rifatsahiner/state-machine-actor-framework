@@ -1,14 +1,19 @@
 # state-machine-actor-framework
-A full-fledged actor model framework with support for hierarchical (nested) UML state-machines
+A full-fledged actor model framework with support for hierarchical (nested) UML state-machines  
+Divide and conquire your projects with encapsulated [actors](https://en.wikipedia.org/wiki/Actor_model) that are constructed as [hierarchical state machines](https://en.wikipedia.org/wiki/UML_state_machine)  
+Unit-test friendly development as an actor being a full enclapsulated ultimate SUT for TDD
 
-- Divide and conquire your projects with encapsulated ["actors"](https://en.wikipedia.org/wiki/Actor_model) that are constructed as [hierarchical state machines](https://en.wikipedia.org/wiki/UML_state_machine)
+## Features
 - Dynamic actor creation and related thread management
 - Zero-copy event delivery system with thread safe event queue structures
 - Timed event delivery
 - Direct or publish-subscribe actor communication
+- Unit-test utility methods for checking resulted state of actors after event process
 - System-wide state monitoring with built-in TUI
+- File logging for every actor on its seperate file with rotation
 - Built-in CLI utility for event-injection or other test/trigger purposes
 
+<br>
 
 ![Framework TUI](images/tui.png)
 
