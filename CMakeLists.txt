@@ -91,14 +91,14 @@ endif()
 get_target_property(JSON_INCLUDE_DIR nlohmann_json::nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
 
 ############ FMT ############ update!!
-find_package(fmt 11.1 QUIET)
+find_package(fmt 12.2 QUIET)
 if(fmt_FOUND)
     message(STATUS "fmt found via find_package")
 else()
     message(STATUS "fmt not found. Fetching from source.")
     FetchContent_Declare(fmt
         GIT_REPOSITORY https://github.com/fmtlib/fmt
-        GIT_TAG 11.2.0
+        GIT_TAG 12.2.0
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     set(FMT_INSTALL ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(fmt)
@@ -263,19 +263,25 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 
 
 
+# Task -> Actor
 # tum loglama isini spdlog'a cevir
-# reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle -> spdlog'a yaptir
-# set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
+    # reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle -> spdlog'a yaptir
+    # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
     # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
     # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek
-# bir klasorde 10k yada 20k dan fazla log dosyası olmasını engelle, 33k dosya varken bu sekilde bir hata aldim
 # task queue icin moodycamel::ConcurrentQueue dene
+# reduce standart requirement to c++17
+
+# diğer işlerden önce fark edilmek için example ekle
+# --no-signal-handle ve --no-terminal-log ekle
+# bir klasorde 10k yada 20k dan fazla log dosyası olmasını engelle, 33k dosya varken bu sekilde bir hata aldim
 # add fetch and install for asio too
 # make compile options for tui and cli -> "If you split into components (e.g., core, tui), use COMPONENTS in find_package and separate exports"
 # auto install for dependencies is not recommended. so provide an option to install all or just uOS and make just uOS as rcommended option
 # add option for building shared library
 # add uninstall
 # option(uOS_MODULE "Build a module instead of a traditional library." OFF) --> bunu ekle ve node.js tarzı module yap (örneği FMT'den çaldım)
+
 # add tests
 # add examples
 # log view finalize

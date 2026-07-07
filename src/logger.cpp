@@ -164,7 +164,7 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
         // configure loger
         _loggerTasks->setText(L"Logger");
         _loggerTasks->unsetShadow();
-        _loggerTasks->setResizeable(true);
+        _loggerTasks->setResizable(true);
         _loggerTasks->setGeometry(finalcut::FPoint{1,1}, finalcut::FSize{_tui->getDesktopWidth(), _tui->getDesktopHeight()});
         _loggerTasks->registerOnQuit(quitCb.value());
         _loggerTasks->show();  // todo: bunu start'a taşıyabiliriz

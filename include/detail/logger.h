@@ -9,7 +9,7 @@
 #include <fstream>
 #include <shared_mutex>
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 
 #include "uOS_defs.h"
 

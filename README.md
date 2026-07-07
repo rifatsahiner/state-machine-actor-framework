@@ -1,5 +1,4 @@
 # state-machine-actor-framework
-A full-fledged actor model framework with support for hierarchical (nested) UML state-machines  
 Divide and conquire your projects with encapsulated [actors](https://en.wikipedia.org/wiki/Actor_model) that are constructed as [hierarchical state machines](https://en.wikipedia.org/wiki/UML_state_machine)  
 Unit-test friendly development as an actor being a full enclapsulated ultimate SUT for TDD
 
@@ -33,18 +32,15 @@ This implementation of UML state-machine framework, however, is intended for hig
 ## Libraries
 - pthread
 - asio (standalone)
-- dw
-- gpm
-- ncurses
+- libdw-dev
+- libgpm-dev
+- libncurses-dev
 
 ## Tools
 - CMake >3.15
 - GIT
 - pkg-config
 - libtool
-- automake
-- autoconf
-- autotools-dev
 - autoconf-archive
 
 rescue yourself from concurency/multi-threding hell with fully encapsulated actors

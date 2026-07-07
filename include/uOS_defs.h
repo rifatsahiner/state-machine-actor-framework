@@ -36,7 +36,7 @@ constexpr SignalId SIG_TICK_SEC = static_cast<SignalId>(4);
 constexpr SignalId SIG_TICK_MIN = static_cast<SignalId>(5);
 constexpr SignalId SIG_TICK_HOUR = static_cast<SignalId>(6);
 
-/// Offsets for user signals
+// Offsets for user signals
 constexpr SignalId INT_SIGNAL_START = static_cast<SignalId>(7);
 constexpr SignalId EXT_SIGNAL_START = static_cast<SignalId>(64);
 
