@@ -101,6 +101,8 @@ class FW
         static inline cli::Menu* _cliRootMenu;
 
         // private functions
+        static std::shared_ptr<Task> _requireTask(TaskId taskId);
+        static std::shared_ptr<Task> _findTask(TaskId taskId);
         static TaskId _getAvailableTaskId(void);
         static TimerId _getAvailableTimerId(void);
         static void _insertTimerQueue(TimerId, uint_fast16_t);

@@ -269,10 +269,13 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
     # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
     # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
     # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek
+    # task'lar log stream'lerini başka objelere yollayabilecek, child state machine'lar, tcp/sctp kütüphaneleri de task stream'ine loglayabilmeli
+# timer id hiçbir zaman 0 vermeyecek şekilde değiştirilecek
 # task queue icin moodycamel::ConcurrentQueue dene
-# reduce standart requirement to c++17
+# reduce standard requirement to c++17
 
 # diğer işlerden önce fark edilmek için example ekle
+# sistemdeki eventleri izlemek için bir tool yazılımı yapılacak (AI ile yap)
 # --no-signal-handle ve --no-terminal-log ekle
 # bir klasorde 10k yada 20k dan fazla log dosyası olmasını engelle, 33k dosya varken bu sekilde bir hata aldim
 # add fetch and install for asio too

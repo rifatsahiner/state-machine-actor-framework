@@ -6,8 +6,8 @@
 #include <memory>
 #include <cassert>
 
-#define uOS_FW_MAX_TASK_COUNT 1024
-#define uOS_FW_MAX_TIMER_COUNT 4096
+#define uOS_FW_MAX_TASK_COUNT 128
+#define uOS_FW_MAX_TIMER_COUNT 256
 
 
 namespace uOS {
@@ -38,7 +38,8 @@ constexpr SignalId SIG_TICK_HOUR = static_cast<SignalId>(6);
 
 // Offsets for user signals
 constexpr SignalId INT_SIGNAL_START = static_cast<SignalId>(7);
-constexpr SignalId EXT_SIGNAL_START = static_cast<SignalId>(64);
+constexpr SignalId CHILD_SIGNAL_START = static_cast<SignalId>(64);
+constexpr SignalId EXT_SIGNAL_START = static_cast<SignalId>(96);
 
 // event
 struct Event {

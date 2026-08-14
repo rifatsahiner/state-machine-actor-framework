@@ -38,7 +38,7 @@ class Task : public StateMachine
         ~Task();
 
     protected:
-        Task(const TaskId, const std::string&);
+        Task(const TaskId, const std::string&); // todo: bu kontrol edilecek std::string&& olması daha uygun
         
         Task(const Task& other) = delete;
         Task& operator= (const Task& rhs) = delete;
@@ -47,6 +47,7 @@ class Task : public StateMachine
 
         // termination psude-state -> 🔘
         // user tasks can override this if a custom termination needed
+        // todo: bu pointer event şeklinde kalmış, değiştirilecek
         virtual HandleResult _terminationState(const std::shared_ptr<const Event>&);
 
         // user task service methods
