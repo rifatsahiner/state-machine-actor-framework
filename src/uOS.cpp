@@ -2,14 +2,16 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
-#include <fstream>
 #include <iterator>
+#ifdef uOS_ENABLE_CLI
+#include <fstream>
 
 #include <cli/cli.h>
 #include <cli/standaloneasioremotecli.h>
 #include <cli/standaloneasioscheduler.h>
 
 #include <nlohmann/json.hpp>
+#endif
 
 #include "uOS.h"
 
@@ -17,16 +19,24 @@ using namespace std::chrono_literals;
 
 namespace uOS {
 
+#ifdef uOS_ENABLE_CLI
 // required for forward decleration
 std::unique_ptr<cli::Cli> FW::_cli;
 std::unique_ptr<cli::StandaloneAsioScheduler> FW::_cliScheduler;
 std::unique_ptr<cli::StandaloneAsioCliTelnetServer> FW::_cliServer;
 std::unordered_map<std::string, cli::CmdHandler> FW::_menuHandlerMap;
+#endif
 
 void FW::init(int argc, char* argv[], const std::string& appName) {
+#ifdef uOS_ENABLE_TUI
     bool tui = true;
+#endif
+#ifdef uOS_ENABLE_CLI
     bool cli = true;
     int cliPort = 42069; // default CLI port
+#else
+    (void)appName;
+#endif
 
     // init usage lists
     _taskIdUsageList.fill(false);
@@ -42,11 +52,18 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
     // parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+#ifdef uOS_ENABLE_TUI
         if (arg == "--no-tui") {
             tui = false;
-        } else if (arg == "--no-cli") {
+            continue;
+        }
+#endif
+#ifdef uOS_ENABLE_CLI
+        if (arg == "--no-cli") {
             cli = false;
-        } else if (arg == "--cli-port" && (i + 1) < argc) {
+            continue;
+        }
+        if (arg == "--cli-port" && (i + 1) < argc) {
             try {
                 size_t pos;
                 std::string port_str = argv[i + 1];
@@ -57,23 +74,34 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
                 }
             } catch (...) {
             }
+            continue;
         }
+#endif
     }
 
     // set interrupt signal handlers
+#ifdef uOS_ENABLE_TUI
     if (tui == false)
         std::signal(SIGINT, _sigintHandler); // set if TUI is not active
+#else
+    std::signal(SIGINT, _sigintHandler);
+#endif
     std::signal(SIGTERM, _sigintHandler);
     std::signal(SIGHUP, _sigintHandler);
     std::signal(SIGQUIT, _sigintHandler);
 
     // init logger
+#ifdef uOS_ENABLE_TUI
     if (tui) {
         Logger::init(argc, argv, &FW::kill); // todo: can set tui name with appName?
     } else {
         Logger::init(argc, argv);
     }
+#else
+    Logger::init(argc, argv);
+#endif
 
+#ifdef uOS_ENABLE_CLI
     // init cli if activated
     if (cli) {
         // setup cli
@@ -89,9 +117,8 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
         fwMenu->Insert("pub-sig-src", &FW::_cliPublishSignalWithSource,
                        "publish a signal only event with source task info <signalId> <sourceTaskId>");
         fwMenu->Insert("post-evt", &FW::_cliPostEvent, "post an event to a task with parameters <signalId> <parameterJsonPath> <targetTaskId>");
-        fwMenu->Insert(
-            "post-evt-src", &FW::_cliPostEventWithSource,
-            "post an event to a task with parameters and source task info <signalId> <parameterJsonPath> <targetTaskId> <sourceTaskId>");
+        fwMenu->Insert("post-evt-src", &FW::_cliPostEventWithSource,
+                       "post an event to a task with parameters and source task info <signalId> <parameterJsonPath> <targetTaskId> <sourceTaskId>");
         fwMenu->Insert("pub-evt", &FW::_cliPublishEvent, "publish an event with parameters <signalId> <parameterJsonPath>");
         fwMenu->Insert("pub-evt-src", &FW::_cliPublishEventWithSource,
                        "publish an event with parameters and source task info <signalId> <parameterJsonPath> <sourceTaskId>");
@@ -124,6 +151,7 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
     } else {
         _cli.reset();
     }
+#endif
 
     // lock memory so we're never swapped out to disk   ????
     // mlockall(MCL_CURRENT | MCL_FUTURE);          // uncomment when supported
@@ -272,10 +300,12 @@ int32_t FW::run() {
             }
         }
 
+#ifdef uOS_ENABLE_CLI
         // handle cli
         if (_cli) {
             _cliScheduler->PollOne();
         }
+#endif
 
         // handle self delete request from tasks
         _handleDelete();
@@ -405,8 +435,10 @@ void FW::deleteTask(TaskId taskId) {
         auto taskIter = _taskMap.find(taskId);
         ASSERT_FOR_FATAL(taskIter != _taskMap.cend());
 
-        // get task name before deletion
+#ifdef uOS_ENABLE_CLI
+        // get task name before deletion (needed to drop its CLI menu)
         std::string taskName = taskIter->second->getName();
+#endif
 
         // delete from map, make its taskId available and remove from sync task list if necessary
         if (auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
@@ -417,6 +449,7 @@ void FW::deleteTask(TaskId taskId) {
         ASSERT_FOR_FATAL(_taskMap.erase(taskId) == 1);
         _taskIdUsageList[taskId] = false;
 
+#ifdef uOS_ENABLE_CLI
         // remove its cli menu if necessary
         if (_cli) {
             // check if it was last task of its kind
@@ -434,6 +467,7 @@ void FW::deleteTask(TaskId taskId) {
                 });
             }
         }
+#endif
     }
 
     // clear its subscriptions
@@ -605,6 +639,7 @@ void FW::deleteAsyncTask(TaskId taskId) {
     LOG(LogLevel::LOG_INFO, "Self delete is schduled for task id: {}", taskId);
 }
 
+#ifdef uOS_ENABLE_CLI
 void FW::registerCliMenu(TaskId taskId, std::unique_ptr<cli::Menu>&& menuPtr) {
     // check if cli is initialized
     if (_cli) {
@@ -629,6 +664,7 @@ void FW::registerCliMenu(TaskId taskId, std::unique_ptr<cli::Menu>&& menuPtr) {
         LOG(LogLevel::LOG_WARNING, "CLI scheduler is not initialized. Cannot register CLI menu for task id: {}", taskId);
     }
 }
+#endif
 
 //////////////////////////////////////////////////////
 //                                                  //
@@ -871,6 +907,7 @@ void FW::_sigintHandler(int signum) {
     kill();
 }
 
+#ifdef uOS_ENABLE_CLI
 void FW::_cliPostSignal(std::ostream& out, int signalId, int targetTaskId) {
     if (static_cast<SignalId>(signalId) < INT_SIGNAL_START) {
         out << "invalid signal id" << std::endl;
@@ -1019,5 +1056,6 @@ void FW::_cliPubEventCommon(std::ostream& out, SignalId signalId, const std::str
         out << "this signal has no subscribers" << std::endl;
     }
 }
+#endif
 
 } // namespace uOS

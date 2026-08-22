@@ -13,9 +13,11 @@
 
 #include "uOS_defs.h"
 
+#ifdef uOS_ENABLE_TUI
 class FLogView;
 class FLogViewMulti;
 namespace finalcut { class FApplication; }
+#endif
 
 
 namespace uOS {
@@ -44,10 +46,12 @@ class Logger {
             TaskLogStream(std::ofstream&& stream, std::filesystem::path&& path, std::string&& file) : fileStream(std::move(stream)), folderPath(std::move(path)), fileName(std::move(file)) { }
         };
 
+#ifdef uOS_ENABLE_TUI
         static inline finalcut::FApplication* _tui {nullptr};
         static inline FLogView* _loggerFw;
         static inline FLogViewMulti* _loggerTasks;
         static inline std::thread _loggerThread;
+#endif
         static inline std::filesystem::path _logFolderPath;
         static inline std::unordered_map<TaskId, TaskLogStream> _taskFileMap;
         static inline std::shared_mutex _taskFileMapMutex;

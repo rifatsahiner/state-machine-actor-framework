@@ -50,6 +50,7 @@ std::string_view Task::getState(void) const
     ASSERT_FOR_FATAL(false);
 }
 
+#ifdef uOS_ENABLE_CLI
 void Task::cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::json& json, std::optional<TaskId> sourceTaskId) {
     (void)signalId;
     (void)json;
@@ -57,6 +58,7 @@ void Task::cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::js
 
     out << "event injector handler is not implemented for this task. id: " << (unsigned)_id << "\n";
 }
+#endif
 
 Task::HandleResult Task::_terminationState(const std::shared_ptr<const uOS::Event>& event){
     HandleResult res;
@@ -96,7 +98,9 @@ TimerId Task::_selfPostIn(uint_fast16_t intervalMs, std::shared_ptr<const Event>
 
 TimerId Task::_selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event> event) { return FW::postEventEvery(intervalMs, _id, std::move(event)); }
 
+#ifdef uOS_ENABLE_CLI
 void Task::_registerCliMenu(std::unique_ptr<cli::Menu>&& menuPtr) { FW::registerCliMenu(_id, std::move(menuPtr)); }
+#endif
 
 
 }   // namespace uOS

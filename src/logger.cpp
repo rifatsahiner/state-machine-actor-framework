@@ -1,10 +1,15 @@
 
 #include "detail/logger.h"
+#ifdef uOS_ENABLE_TUI
 #include "detail/flogview.h"
+#endif
 #include <backward.hpp>
 #include <ctime>
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
+#include <system_error>
+#include <unistd.h>
 // #include <syncstream>
 
 namespace { // anonymous namespace for internal linkage
@@ -15,9 +20,11 @@ constexpr uint_fast32_t MAX_FILE_LOG_LINE_COUNT = 300 * 1000; // 300K lines
 // constexpr std::uintmax_t MAX_TASK_LOG_FOLDER_SIZE = 1024 * 1024;
 // constexpr uint_fast32_t MAX_FILE_LOG_LINE_COUNT = 20;
 
+#ifdef uOS_ENABLE_TUI
 void tuiThreadFunc(void) {
     finalcut::FApplication::getApplicationObject()->exec();
 }
+#endif
 
 constexpr std::string_view _logLevelToString(uOS::LogLevel level) {
     switch (level) {
@@ -37,6 +44,7 @@ constexpr std::string_view _logLevelToColor(uOS::LogLevel level) {
     }
 }
 
+#ifdef uOS_ENABLE_TUI
 // Fast, one‑pass UTF‑8 → wchar_t (assumes wchar_t is at least 32 bits)
 // AI dan copy/paste. kontrol edilecek
 inline std::wstring _utf8ToWstring(const std::string& utf8)
@@ -91,6 +99,7 @@ inline std::wstring _utf8ToWstring(const std::string& utf8)
 
     return out;
 }
+#endif
 
 void _folderSizer(std::filesystem::path folderPath){
     static std::mutex folderSizerMutex;
@@ -148,7 +157,8 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
     const std::string_view systemLogsFolderName = "_SYSTEM";
     std::filesystem::path systemFolderPath;
 
-    // start TUI if argc not null
+#ifdef uOS_ENABLE_TUI
+    // start TUI if a quit callback is provided
     if(quitCb.has_value()) {
         //static finalcut::FApplication app(argc, argv);
         _tui = new finalcut::FApplication(argc, argv);
@@ -169,6 +179,11 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
         _loggerTasks->registerOnQuit(quitCb.value());
         _loggerTasks->show();  // todo: bunu start'a taşıyabiliriz
     }
+#else
+    (void)argc;
+    (void)argv;
+    (void)quitCb;
+#endif
 
     // initialize file logger
     // get binary path in buffer
@@ -177,24 +192,50 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
     ASSERT_FOR_FATAL(len != -1);
     buffer[len] = '\0';
 
-    // create LOGS folder if necessary
-    _logFolderPath = std::filesystem::path(buffer).parent_path() / logsRootFolderName;
-    if (std::filesystem::exists(_logFolderPath) == false) {
-        if (std::filesystem::create_directory(_logFolderPath)) {
-            logsCreated = true;
-        } else {
-            ASSERT_FOR_FATAL(false);
+    auto dirWritable = [](const std::filesystem::path& p) {
+        std::error_code ec;
+        return std::filesystem::is_directory(p, ec) && !ec &&
+               (::access(p.c_str(), W_OK | X_OK) == 0);
+    };
+    auto ensureWritableDir = [&](const std::filesystem::path& p) {
+        std::error_code ec;
+        const bool existed = std::filesystem::is_directory(p, ec);
+        std::filesystem::create_directories(p, ec);
+        if (ec || !dirWritable(p)) {
+            return false;
         }
+        return !existed;
+    };
+    auto xdgStateLogs = [&]() {
+        if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg && xdg[0] != '\0') {
+            return std::filesystem::path(xdg) / "cu-mut" / logsRootFolderName;
+        }
+        if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
+            return std::filesystem::path(home) / ".local" / "state" / "cu-mut" / logsRootFolderName;
+        }
+        std::error_code ec;
+        return std::filesystem::temp_directory_path(ec) / "cu-mut" / logsRootFolderName;
+    };
+
+    // Prefer <exe-dir>/LOGS when writable (dev builds). Packaged /usr/bin is not.
+    _logFolderPath = std::filesystem::path(buffer).parent_path() / logsRootFolderName;
+    if (dirWritable(_logFolderPath)) {
+        logsCreated = false;
+    } else if (ensureWritableDir(_logFolderPath)) {
+        logsCreated = true;
+    } else if (!dirWritable(_logFolderPath)) {
+        _logFolderPath = xdgStateLogs();
+        logsCreated = ensureWritableDir(_logFolderPath);
+        ASSERT_FOR_FATAL(dirWritable(_logFolderPath));
     }
-    
+
     // create _SYSTEM folder if necessary
     systemFolderPath = _logFolderPath / systemLogsFolderName;
-    if(std::filesystem::exists(systemFolderPath) == false){
-        if (std::filesystem::create_directory(systemFolderPath)) {
-            systemCreated = true;
-        } else {
-            ASSERT_FOR_FATAL(false);
-        }
+    if (dirWritable(systemFolderPath)) {
+        systemCreated = false;
+    } else {
+        systemCreated = ensureWritableDir(systemFolderPath);
+        ASSERT_FOR_FATAL(dirWritable(systemFolderPath));
     }
 
     // create system log file
@@ -221,11 +262,15 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
     std::signal(SIGBUS, _systemSignalHandler);  // Bus error
 
     // print info
+#ifdef uOS_ENABLE_TUI
     if(quitCb.has_value()){
         LOG(LogLevel::LOG_INFO, "Logger initialized with TUI");
     } else {
         LOG(LogLevel::LOG_INFO, "Logger initialized without TUI");
     }
+#else
+    LOG(LogLevel::LOG_INFO, "Logger initialized without TUI");
+#endif
     if(logsCreated){
         LOG(LogLevel::LOG_INFO, "Root log folder created");
     }
@@ -235,9 +280,11 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
 }
 
 void Logger::start(void) {
+#ifdef uOS_ENABLE_TUI
     if(_tui != nullptr){
         _loggerThread = std::thread{tuiThreadFunc};
     }
+#endif
 }
 
 void Logger::stop(void) {
@@ -254,6 +301,7 @@ void Logger::stop(void) {
     }
     taskFileMapLock.unlock();
     
+#ifdef uOS_ENABLE_TUI
     // shut down TUI and its thread
     if (_tui) {
         _tui->quit();
@@ -265,6 +313,7 @@ void Logger::stop(void) {
     if (_loggerThread.joinable()) {
         _loggerThread.join();
     }
+#endif
 }
 
 void Logger::addTaskLogger(const TaskId taskId, const std::string& taskName, const std::string& instName) {
@@ -325,10 +374,12 @@ void Logger::addTaskLogger(const TaskId taskId, const std::string& taskName, con
     }
     LOG(LogLevel::LOG_INFO, "Log file created for instance: {} of type: {}", instName, taskName);
     
+#ifdef uOS_ENABLE_TUI
     // add tui view if tui is active
     if(_tui != nullptr){
         _loggerTasks->createView(static_cast<uint_fast16_t>(taskId), taskName);
     }
+#endif
 }
 
 void Logger::removeTaskLogger(const TaskId taskId) {
@@ -341,10 +392,12 @@ void Logger::removeTaskLogger(const TaskId taskId) {
         _taskFileMap.erase(iter);
     }
     
+#ifdef uOS_ENABLE_TUI
     // remove from tui view if tui is active
     if(_tui != nullptr){
         _loggerTasks->removeView(static_cast<uint_fast16_t>(taskId));
     }
+#endif
 }
 
 void Logger::logFw(const char* file, const char* function, const int line, const LogLevel level, const std::string& formattedLogStr) {
@@ -356,11 +409,11 @@ void Logger::logTask(const char* file, const char* function, const int line, con
 }
 
 bool Logger::isActive(void) {
-    if(_tui == nullptr){
-        return false;
-    } else {
-        return true;
-    }
+#ifdef uOS_ENABLE_TUI
+    return _tui != nullptr;
+#else
+    return false;
+#endif
 }
 
 //////////////////////////////////////////////////////
@@ -412,6 +465,7 @@ inline void Logger::_logCommon(const char* file, const char* function, const int
     }
 
     // print to tui or cout
+#ifdef uOS_ENABLE_TUI
     if(_tui != nullptr) {
         std::wstring wstr = _utf8ToWstring(logLine);
 
@@ -421,28 +475,29 @@ inline void Logger::_logCommon(const char* file, const char* function, const int
             // todo: handle system log on TUI
             // _loggerFw->log(std::move(wstr), static_cast<FLogView::LogLevel>(level));
         }
-    } else {
-        // print to cout if TUI is not active and level is above TRACE
-        if(level != LogLevel::LOG_TRACE) {
-            constexpr std::string_view colorReset = "\033[0m";
+        return;
+    }
+#endif
+    // print to cout if TUI is not active and level is above TRACE
+    if(level != LogLevel::LOG_TRACE) {
+        constexpr std::string_view colorReset = "\033[0m";
 
-            // Identifier: task name/instance if available, otherwise "SYSTEM"
-            std::string_view identifier = taskId ? taskIdentifier : "SYSTEM";
-            if (level != LogLevel::LOG_INFO) {
-                // Colored output for WARNING/ERROR
-                fmt::print("{}{}{} {} [|] {}\n",
-                    _logLevelToColor(level),      // e.g. "\033[38;5;208m" or "\033[31m"
-                    _logLevelToString(level),     // e.g. "WARNING "
-                    colorReset,
-                    identifier,
-                    logStr);
-            } else {
-                // No color for INFO
-                fmt::print("{} {} [|] {}\n",
-                    _logLevelToString(level),
-                    identifier,
-                    logStr);
-            }
+        // Identifier: task name/instance if available, otherwise "SYSTEM"
+        std::string_view identifier = taskId ? taskIdentifier : "SYSTEM";
+        if (level != LogLevel::LOG_INFO) {
+            // Colored output for WARNING/ERROR
+            fmt::print("{}{}{} {} [|] {}\n",
+                _logLevelToColor(level),      // e.g. "\033[38;5;208m" or "\033[31m"
+                _logLevelToString(level),     // e.g. "WARNING "
+                colorReset,
+                identifier,
+                logStr);
+        } else {
+            // No color for INFO
+            fmt::print("{} {} [|] {}\n",
+                _logLevelToString(level),
+                identifier,
+                logStr);
         }
     }
 }

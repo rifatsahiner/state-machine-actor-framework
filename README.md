@@ -8,9 +8,9 @@ Unit-test friendly development as an actor being a full enclapsulated ultimate S
 - Timed event delivery
 - Direct or publish-subscribe actor communication
 - Unit-test utility methods for checking resulted state of actors after event process
-- System-wide state monitoring with built-in TUI
+- Optional system-wide state monitoring TUI (`-DuOS_ENABLE_TUI=ON`)
 - File logging for every actor on its seperate file with rotation
-- Built-in CLI utility for event-injection or other test/trigger purposes
+- Optional CLI utility for event-injection or other test/trigger purposes (`-DuOS_ENABLE_CLI=ON`)
 
 <br>
 
@@ -29,19 +29,39 @@ This implementation of UML state-machine framework, however, is intended for hig
 
 # Project Dependencies
 
-## Libraries
-- pthread
-- asio (standalone)
-- libdw-dev
-- libgpm-dev
-- libncurses-dev
+TUI and CLI are off by default. Enable them at configure time:
 
-## Tools
+```bash
+cmake -S . -B build -DuOS_ENABLE_TUI=ON -DuOS_ENABLE_CLI=ON
+```
+
+## Always required
+
+### Libraries
+- pthread
+- libdw-dev
+
+### Tools
 - CMake >3.15
 - GIT
 - pkg-config
+
+## Only with `-DuOS_ENABLE_TUI=ON`
+
+### Libraries
+- libgpm-dev
+- libncurses-dev
+
+### Tools (needed when finalcut is built from source)
 - libtool
 - autoconf-archive
+
+## Only with `-DuOS_ENABLE_CLI=ON`
+
+### Libraries
+- asio (standalone)
+- nlohmann/json (fetched if not installed)
+- cli (daniele77/cli, fetched if not installed)
 
 rescue yourself from concurency/multi-threding hell with fully encapsulated actors
 rescue yourself from convoluted logics, 50 tier elseif, numerous flags with UML state-machines 

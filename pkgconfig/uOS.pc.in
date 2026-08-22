@@ -9,7 +9,7 @@ Description: Hierarchical state-machine framework C++ library.
 Version: @PROJECT_VERSION@
 URL: https://github.com/rifatsahiner/state-machine-framework
 Requires: fmt >= 11.1
-Requires.private: finalcut ncurses libdw
+Requires.private: @UOS_PC_REQUIRES_PRIVATE@
 Libs: -L${libdir} -luOS -pthread
-Libs.private: -lrt -lgpm
-Cflags: -I${includedir}/uOS
+Libs.private: @UOS_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}/uOS @UOS_PC_EXTRA_CFLAGS@
