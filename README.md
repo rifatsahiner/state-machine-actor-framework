@@ -39,12 +39,22 @@ cmake -S . -B build -DuOS_ENABLE_TUI=ON -DuOS_ENABLE_CLI=ON
 
 ### Libraries
 - pthread
-- libdw-dev
 
 ### Tools
 - CMake >3.15
 - GIT
 - pkg-config
+
+## Linux only (crash backtraces)
+
+Pretty stack traces on crash need a DWARF reader. Configure picks the first available, in this order:
+- libdw-dev (preferred, from elfutils)
+- binutils-dev (libbfd)
+- libdwarf-dev (plus libelf)
+
+If none of those are installed, configure fails and asks for libdw.
+
+macOS uses `backtrace_symbols` instead and needs none of these packages.
 
 ## Only with `-DuOS_ENABLE_TUI=ON`
 

@@ -183,26 +183,45 @@ if(uOS_ENABLE_TUI)
 endif()
 
 ############ BACKWARD ############
-# check for libdw
-find_library(DW_LIB dw)
-if(NOT DW_LIB)
-    message(FATAL_ERROR "libdw not found. Please install libdw (e.g., elfutils).")
+# Use backward-cpp's CMake so BACKWARD_HAS_* is set and the right debug-info
+# library is linked. Auto-detect order is libdw → libbfd → libdwarf →
+# backtrace_symbols. On Linux we reject the last of those: a DWARF reader is
+# required, and the error tells the user to install libdw. Darwin only supports
+# backtrace_symbols and does not need extra packages.
+set(BACKWARD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(backward
+    GIT_REPOSITORY https://github.com/bombela/backward-cpp
+    GIT_TAG        master
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    EXCLUDE_FROM_ALL)
+# backward's CMakeLists installs its header even as a subproject; keep that
+# out of `cmake --install` for uOS.
+set(_uos_skip_install "${CMAKE_SKIP_INSTALL_RULES}")
+set(CMAKE_SKIP_INSTALL_RULES ON)
+FetchContent_MakeAvailable(backward)
+set(CMAKE_SKIP_INSTALL_RULES "${_uos_skip_install}")
+
+get_target_property(_uos_bw_defs Backward::Interface INTERFACE_COMPILE_DEFINITIONS)
+if(NOT _uos_bw_defs)
+    set(_uos_bw_defs "${BACKWARD_DEFINITIONS}")
 endif()
-
-find_path(BW_INCLUDE_DIR
-    NAMES backward.hpp
-    PATHS /usr/include /usr/local/include ${CMAKE_INCLUDE_PATH}
-)
-if(BW_INCLUDE_DIR)
-    message(STATUS "Backward found at ${BW_INCLUDE_DIR}")
+if("BACKWARD_HAS_DW=1" IN_LIST _uos_bw_defs)
+    set(_uos_bw_backend dw)
+    message(STATUS "backward-cpp debug info: libdw")
+elseif("BACKWARD_HAS_BFD=1" IN_LIST _uos_bw_defs)
+    set(_uos_bw_backend bfd)
+    message(STATUS "backward-cpp debug info: libbfd")
+elseif("BACKWARD_HAS_DWARF=1" IN_LIST _uos_bw_defs)
+    set(_uos_bw_backend dwarf)
+    message(STATUS "backward-cpp debug info: libdwarf")
 else()
-    # fetch backward-cpp
-    FetchContent_Declare(backward
-        GIT_REPOSITORY  https://github.com/bombela/backward-cpp
-        GIT_TAG         master)
-
-    FetchContent_Populate(backward)  # Only populate; do not make available
-    set(BW_INCLUDE_DIR ${backward_SOURCE_DIR})
+    set(_uos_bw_backend symbols)
+    message(STATUS "backward-cpp debug info: backtrace_symbols")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _uos_bw_backend STREQUAL "symbols")
+    message(FATAL_ERROR
+        "No DWARF debug-info library found for backward-cpp "
+        "(tried libdw, libbfd, libdwarf). Install libdw (e.g. libdw-dev / elfutils).")
 endif()
 
 # Include directories
@@ -216,7 +235,6 @@ if(uOS_ENABLE_CLI)
     target_include_directories(${PROJECT_NAME} PRIVATE ${JSON_INCLUDE_DIR})
     target_compile_definitions(${PROJECT_NAME} PUBLIC uOS_ENABLE_CLI)
 endif()
-target_include_directories(${PROJECT_NAME} PRIVATE ${BW_INCLUDE_DIR})
 target_include_directories(${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include/uOS>)
@@ -225,7 +243,10 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 find_package(Threads REQUIRED)
 target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
 target_link_libraries(${PROJECT_NAME} PUBLIC fmt::fmt)
-target_link_libraries(${PROJECT_NAME} PRIVATE ${DW_LIB})
+# BUILD_INTERFACE: uOS is static, so a PRIVATE dep would otherwise be
+# exported and cmake --install would demand an exported backward_interface.
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    $<BUILD_INTERFACE:Backward::Interface>)
 if(uOS_ENABLE_TUI)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${FINALCUT_LINK} gpm ncurses rt)
 endif()
@@ -291,13 +312,21 @@ install(FILES
         DESTINATION lib/cmake/uOS)
 
 # Generate and install pkg-config file
+set(_uos_pc_requires)
+set(_uos_pc_libs)
 if(uOS_ENABLE_TUI)
-    set(UOS_PC_REQUIRES_PRIVATE "finalcut ncurses libdw")
-    set(UOS_PC_LIBS_PRIVATE "-lrt -lgpm")
-else()
-    set(UOS_PC_REQUIRES_PRIVATE "libdw")
-    set(UOS_PC_LIBS_PRIVATE "")
+    list(APPEND _uos_pc_requires finalcut ncurses)
+    list(APPEND _uos_pc_libs -lrt -lgpm)
 endif()
+if(_uos_bw_backend STREQUAL "dw")
+    list(APPEND _uos_pc_requires libdw)
+elseif(_uos_bw_backend STREQUAL "bfd")
+    list(APPEND _uos_pc_libs -lbfd -ldl)
+elseif(_uos_bw_backend STREQUAL "dwarf")
+    list(APPEND _uos_pc_libs -ldwarf -lelf -ldl)
+endif()
+string(REPLACE ";" " " UOS_PC_REQUIRES_PRIVATE "${_uos_pc_requires}")
+string(REPLACE ";" " " UOS_PC_LIBS_PRIVATE "${_uos_pc_libs}")
 set(UOS_PC_EXTRA_CFLAGS "")
 if(uOS_ENABLE_TUI)
     string(APPEND UOS_PC_EXTRA_CFLAGS "-DuOS_ENABLE_TUI ")
