@@ -34,8 +34,6 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
 #ifdef uOS_ENABLE_CLI
     bool cli = true;
     int cliPort = 42069; // default CLI port
-#else
-    (void)appName;
 #endif
 
     // init usage lists
@@ -93,12 +91,12 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
     // init logger
 #ifdef uOS_ENABLE_TUI
     if (tui) {
-        Logger::init(argc, argv, &FW::kill); // todo: can set tui name with appName?
+        Logger::init(argc, argv, appName, &FW::kill); // todo: can set tui name with appName?
     } else {
-        Logger::init(argc, argv);
+        Logger::init(argc, argv, appName);
     }
 #else
-    Logger::init(argc, argv);
+    Logger::init(argc, argv, appName);
 #endif
 
 #ifdef uOS_ENABLE_CLI

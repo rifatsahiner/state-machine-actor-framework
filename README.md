@@ -9,7 +9,7 @@ Unit-test friendly development as an actor being a full enclapsulated ultimate S
 - Direct or publish-subscribe actor communication
 - Unit-test utility methods for checking resulted state of actors after event process
 - Optional system-wide state monitoring TUI (`-DuOS_ENABLE_TUI=ON`)
-- File logging for every actor on its seperate file with rotation
+- File logging for every actor on its seperate file with rotation (next to the binary when writable; otherwise under `$XDG_STATE_HOME/<appName>/LOGS`)
 - Optional CLI utility for event-injection or other test/trigger purposes (`-DuOS_ENABLE_CLI=ON`)
 
 <br>
@@ -55,6 +55,12 @@ Pretty stack traces on crash need a DWARF reader. Configure picks the first avai
 If none of those are installed, configure fails and asks for libdw.
 
 macOS uses `backtrace_symbols` instead and needs none of these packages.
+
+## Log directory (Linux and macOS)
+
+`Logger` writes `LOGS/` next to the executable when that directory is writable (local builds). If it is not (for example a binary under `/usr/bin`), logs go to `$XDG_STATE_HOME/<appName>/LOGS`, or `~/.local/state/<appName>/LOGS`. `<appName>` is the string passed to `FW::init` (default `uOS-App`).
+
+The executable path is resolved with `/proc/self/exe` on Linux and `_NSGetExecutablePath` on macOS. Failure to resolve it is not fatal; logging falls through to the XDG/temp location.
 
 ## Only with `-DuOS_ENABLE_TUI=ON`
 

@@ -10,6 +10,10 @@
 #include <cstdlib>
 #include <system_error>
 #include <unistd.h>
+#include <vector>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 // #include <syncstream>
 
 namespace { // anonymous namespace for internal linkage
@@ -101,6 +105,38 @@ inline std::wstring _utf8ToWstring(const std::string& utf8)
 }
 #endif
 
+std::filesystem::path currentExecutablePath() {
+#if defined(__linux__)
+    char buffer[4096];
+    const ssize_t len = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (len > 0) {
+        buffer[len] = '\0';
+        return std::filesystem::path(buffer);
+    }
+    return {};
+#elif defined(__APPLE__)
+    uint32_t size = 1024;
+    std::vector<char> buf(size);
+    if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+        if (size == 0) {
+            return {};
+        }
+        buf.resize(size);
+        if (_NSGetExecutablePath(buf.data(), &size) != 0) {
+            return {};
+        }
+    }
+    if (char* resolved = ::realpath(buf.data(), nullptr)) {
+        std::filesystem::path path(resolved);
+        std::free(resolved);
+        return path;
+    }
+    return std::filesystem::path(buf.data());
+#else
+    return {};
+#endif
+}
+
 void _folderSizer(std::filesystem::path folderPath){
     static std::mutex folderSizerMutex;
 
@@ -149,7 +185,7 @@ void _folderSizer(std::filesystem::path folderPath){
 namespace uOS {
 
 
-void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)>> quitCb)
+void Logger::init(int argc, char* argv[], const std::string& appName, std::optional<std::function<void(void)>> quitCb)
 {
     bool logsCreated = false;
     bool systemCreated = false;
@@ -186,12 +222,6 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
 #endif
 
     // initialize file logger
-    // get binary path in buffer
-    char buffer[1024];
-    ssize_t len = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-    ASSERT_FOR_FATAL(len != -1);
-    buffer[len] = '\0';
-
     auto dirWritable = [](const std::filesystem::path& p) {
         std::error_code ec;
         return std::filesystem::is_directory(p, ec) && !ec &&
@@ -206,24 +236,36 @@ void Logger::init(int argc, char* argv[], std::optional<std::function<void(void)
         }
         return !existed;
     };
+    const std::string stateAppName = appName.empty() ? std::string("uOS") : appName;
     auto xdgStateLogs = [&]() {
         if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg && xdg[0] != '\0') {
-            return std::filesystem::path(xdg) / "cu-mut" / logsRootFolderName;
+            return std::filesystem::path(xdg) / stateAppName / logsRootFolderName;
         }
         if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
-            return std::filesystem::path(home) / ".local" / "state" / "cu-mut" / logsRootFolderName;
+            return std::filesystem::path(home) / ".local" / "state" / stateAppName / logsRootFolderName;
         }
         std::error_code ec;
-        return std::filesystem::temp_directory_path(ec) / "cu-mut" / logsRootFolderName;
+        return std::filesystem::temp_directory_path(ec) / stateAppName / logsRootFolderName;
     };
 
     // Prefer <exe-dir>/LOGS when writable (dev builds). Packaged /usr/bin is not.
-    _logFolderPath = std::filesystem::path(buffer).parent_path() / logsRootFolderName;
-    if (dirWritable(_logFolderPath)) {
-        logsCreated = false;
-    } else if (ensureWritableDir(_logFolderPath)) {
-        logsCreated = true;
-    } else if (!dirWritable(_logFolderPath)) {
+    // Executable lookup is platform-specific and non-fatal: Linux uses
+    // /proc/self/exe, macOS uses _NSGetExecutablePath. Empty path falls through
+    // to the XDG/temp location.
+    bool usedExeDir = false;
+    if (const auto exe = currentExecutablePath(); !exe.empty()) {
+        _logFolderPath = exe.parent_path() / logsRootFolderName;
+        if (dirWritable(_logFolderPath)) {
+            logsCreated = false;
+            usedExeDir = true;
+        } else if (ensureWritableDir(_logFolderPath)) {
+            logsCreated = true;
+            usedExeDir = true;
+        } else if (dirWritable(_logFolderPath)) {
+            usedExeDir = true;
+        }
+    }
+    if (!usedExeDir) {
         _logFolderPath = xdgStateLogs();
         logsCreated = ensureWritableDir(_logFolderPath);
         ASSERT_FOR_FATAL(dirWritable(_logFolderPath));

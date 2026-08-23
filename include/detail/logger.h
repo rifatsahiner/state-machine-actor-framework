@@ -25,7 +25,8 @@ namespace uOS {
 
 class Logger {
     public:
-        static void init(int, char*[], std::optional<std::function<void(void)>> = std::nullopt);
+        static void init(int, char*[], const std::string& appName = "uOS",
+                         std::optional<std::function<void(void)>> = std::nullopt);
         static void start(void);
         static void stop(void);
         static void addTaskLogger(const TaskId, const std::string&, const std::string&);
