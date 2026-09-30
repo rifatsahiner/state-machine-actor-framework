@@ -171,4 +171,6 @@ public:
 
 } // namespace uOS
 
+#include "child_state_machine.h"
+
 #endif // uOS_H

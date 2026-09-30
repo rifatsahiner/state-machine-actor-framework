@@ -345,6 +345,11 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 
 
 # Task -> Actor
+# on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
+# task'ların alt komponentlerine (ör: child state machine yada tcp/sctp objesi gibi) log stream'lerini yollayabilmesi icin bir yol olustur. Bunu alt madde ile birlikte düşün
+    # bu yapıldıktan soran StateMachine'den ChildSm diye bir class extend et. Bu parent actor id ve parent actor log stream'ini alacak
+    # actor'e friend olabilir, benzer şekilde parent'ın resource'larını kullanabileceği bir yapı kurulabilir. Child SM ihtiyacı olduğunda bunu kullanacak
+    # actor de create_child_sm diye bir fonksiyon olablir, _id ve _logStream'i otomatik geçer. Burada shared_ref_collection gibi bir obje yerine liste olarak paylaşılacak objeleri girebilir miyim?
 # tum loglama isini spdlog'a cevir
     # reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle -> spdlog'a yaptir
     # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
