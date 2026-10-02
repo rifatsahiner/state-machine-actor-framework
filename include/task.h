@@ -65,7 +65,8 @@ protected:
     TimerId _selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
     virtual void _selfStop(void) = 0;
     virtual void _selfDelete(void) = 0;
-    LogStream logStream() const { return _log; }
+    // Reference to this task's stream. Copy it to keep a handle.
+    const LogStream& logStream() const { return _log; }
 #ifdef uOS_ENABLE_CLI
     void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 #endif

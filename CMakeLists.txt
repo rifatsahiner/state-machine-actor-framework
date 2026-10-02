@@ -119,6 +119,7 @@ FetchContent_Declare(quill
     GIT_REPOSITORY https://github.com/odygrd/quill.git
     GIT_TAG v13.0.0
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+set(QUILL_DISABLE_NON_PREFIXED_MACROS ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(quill)
 
 ############ FINALCUT (optional TUI) ############
@@ -239,7 +240,6 @@ if(uOS_ENABLE_CLI)
 endif()
 target_include_directories(${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${INCLUDE_DIR}>
-    $<BUILD_INTERFACE:${quill_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include/uOS>
     $<INSTALL_INTERFACE:include>)
 target_compile_definitions(${PROJECT_NAME} PUBLIC QUILL_DISABLE_NON_PREFIXED_MACROS)
@@ -247,6 +247,9 @@ target_compile_definitions(${PROJECT_NAME} PUBLIC QUILL_DISABLE_NON_PREFIXED_MAC
 # link libraries
 find_package(Threads REQUIRED)
 target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
+# Build tree only. Exporting quill::quill would make the installed package require Quill.
+# Installed consumers get the vendored headers under include/uOS/quill.
+target_link_libraries(${PROJECT_NAME} PUBLIC $<BUILD_INTERFACE:quill::quill>)
 # BUILD_INTERFACE: uOS is static, so a PRIVATE dep would otherwise be
 # exported and cmake --install would demand an exported backward_interface.
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -278,7 +281,7 @@ install(DIRECTORY ${INCLUDE_DIR}/
         FILES_MATCHING PATTERN "*.h"
         ${UOS_HEADER_EXCLUDES})
 install(DIRECTORY ${quill_SOURCE_DIR}/include/quill
-        DESTINATION include)
+        DESTINATION include/uOS)
 
 # Install the library and export targets
 set(UOS_INSTALL_TARGETS ${PROJECT_NAME})

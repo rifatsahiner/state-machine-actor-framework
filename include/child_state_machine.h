@@ -32,7 +32,8 @@ protected:
 
     TaskId parentTaskId() const noexcept { return _parentTaskId; }
 
-    LogStream logStream() const { return _log; }
+    // Reference to this machine's stream. Copy it to keep a handle.
+    const LogStream& logStream() const { return _log; }
 
     void postToParent(std::shared_ptr<const Event> event) const { FW::postEvent(_parentTaskId, std::move(event)); }
 

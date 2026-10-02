@@ -3,6 +3,7 @@
 
 #include "uOS_defs.h"
 
+#include <atomic>
 #include <memory>
 #include <string_view>
 
@@ -48,33 +49,41 @@ public:
     std::string_view typeName() const noexcept;
     quill::Logger* native() const noexcept;
 
-    // Impl is private. Callers outside this library cannot build a non-empty stream.
+private:
+    // Only Logger builds a non-empty stream.
     explicit LogStream(std::shared_ptr<Impl> impl) noexcept;
 
-private:
     std::shared_ptr<Impl> _impl;
 
     friend class Logger;
 };
 
-LogStream systemLog();
+// Reference to the process stream. Copy it to keep a handle.
+const LogStream& systemLog();
 void prepareLogThread();
+
+namespace detail {
+
+// Published when the system logger exists. SLOG loads this and does not lock or copy a stream.
+inline std::atomic<quill::Logger*> systemLogger{nullptr};
+
+} // namespace detail
 
 } // namespace uOS
 
 // level must be a constant uOS::LogLevel. LOG uses the enclosing object's
 // logStream() (Task, ChildStateMachine, or a member that stores a LogStream).
 // Free functions use SLOG. LOG_TO takes an explicit stream.
-#define UOS_LOG_TO(stream, level, fmt, ...)                                                                \
+// The stream expression is bound by reference for this statement only.
+#define UOS_LOG_NATIVE(logger_ptr, level, fmt, ...)                                                        \
     do {                                                                                                   \
-        auto _uos_stream = (stream);                                                                       \
         static_assert((level) == ::uOS::LogLevel::LOG_TRACE_L3 || (level) == ::uOS::LogLevel::LOG_TRACE_L2 || \
                           (level) == ::uOS::LogLevel::LOG_TRACE_L1 || (level) == ::uOS::LogLevel::LOG_DEBUG ||  \
                           (level) == ::uOS::LogLevel::LOG_INFO || (level) == ::uOS::LogLevel::LOG_NOTICE ||    \
                           (level) == ::uOS::LogLevel::LOG_WARNING || (level) == ::uOS::LogLevel::LOG_ERROR || \
                           (level) == ::uOS::LogLevel::LOG_CRITICAL,                                          \
                       "LOG level must be a constant uOS::LogLevel other than LOG_NONE");                    \
-        if (auto* _uos_logger = _uos_stream.native()) {                                                    \
+        if (auto* _uos_logger = (logger_ptr)) {                                                            \
             if constexpr ((level) == ::uOS::LogLevel::LOG_TRACE_L3) {                                      \
                 QUILL_LOG_TRACE_L3(_uos_logger, fmt, ##__VA_ARGS__);                                       \
             } else if constexpr ((level) == ::uOS::LogLevel::LOG_TRACE_L2) {                               \
@@ -97,8 +106,14 @@ void prepareLogThread();
         }                                                                                                  \
     } while (0)
 
+#define UOS_LOG_TO(stream, level, fmt, ...)                                                                \
+    do {                                                                                                   \
+        ::uOS::LogStream const& _uos_stream = (stream);                                                    \
+        UOS_LOG_NATIVE(_uos_stream.native(), level, fmt, ##__VA_ARGS__);                                  \
+    } while (0)
+
 #define LOG(level, fmt, ...) UOS_LOG_TO(this->logStream(), level, fmt, ##__VA_ARGS__)
-#define SLOG(level, fmt, ...) UOS_LOG_TO(::uOS::systemLog(), level, fmt, ##__VA_ARGS__)
+#define SLOG(level, fmt, ...) UOS_LOG_NATIVE(::uOS::detail::systemLogger.load(std::memory_order_acquire), level, fmt, ##__VA_ARGS__)
 #define LOG_TO(stream, level, fmt, ...) UOS_LOG_TO(stream, level, fmt, ##__VA_ARGS__)
 
 #endif // uOS_LOG_STREAM_H

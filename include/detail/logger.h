@@ -40,6 +40,10 @@ public:
     static std::filesystem::path logRoot();
     // Lines handed to the TUI or the console since init. Empty unless UOS_LOG_CAPTURE is set.
     static std::vector<std::string> capturedUi();
+
+private:
+    static LogStream makeStream(const std::filesystem::path& folder, const std::filesystem::path& path, std::string loggerName,
+                                std::string typeName, uint16_t viewId, LogLimits limits, bool system, TaskId id);
 };
 
 } // namespace uOS

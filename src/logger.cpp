@@ -39,6 +39,7 @@
 #include <limits>
 #include <mutex>
 #include <poll.h>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -85,7 +86,7 @@ finalcut::FApplication* g_tui = nullptr;
 FLogViewMulti* g_tuiView = nullptr;
 std::thread g_tuiThread;
 #endif
-bool g_tuiOn = false;
+std::atomic<bool> g_tuiOn{false};
 
 std::filesystem::path g_logRoot;
 
@@ -272,14 +273,16 @@ public:
     void write_log(quill::MacroMetadata const*, uint64_t, std::string_view, std::string_view, std::string const&, std::string_view,
                    quill::LogLevel log_level, std::string_view, std::string_view, std::vector<std::pair<std::string, std::string>> const*,
                    std::string_view, std::string_view log_statement) override {
-        if (!g_tuiOn || g_tuiView == nullptr) {
+        // TODO: hand the line to the finalcut thread instead of drawing from the backend thread.
+        // The widget mutex covers the log list, not finalcut's own redraw.
+        if (!g_tuiOn.load(std::memory_order_acquire) || g_tuiView == nullptr) {
             return;
         }
         std::string_view line = log_statement;
         if (!line.empty() && line.back() == '\n') {
             line.remove_suffix(1);
         }
-        g_tuiView->log(utf8ToWstring(line), static_cast<FLogView::LogLevel>(static_cast<uint8_t>(log_level)), _viewId);
+        g_tuiView->log(utf8ToWstring(line), static_cast<uOS::LogLevel>(static_cast<uint8_t>(log_level)), _viewId);
     }
 
     void flush_sink() override {}
@@ -372,6 +375,13 @@ std::filesystem::path uniqueLogPath(const std::filesystem::path& folder, const s
 
 std::uintmax_t rotationBytes(const uOS::LogLimits& limits) { return std::max(limits.maxFileBytes, std::uintmax_t{512}); }
 
+// Caps the live index chain (name.log, name.1.log, ...). sweepFolder deletes other closed
+// files in the folder. The chain stays protected so Quill can rename it; sweep must not
+// delete a member of it.
+// TODO: roll each segment onto a new unique file and protect only the open file, so
+// sweepFolder is the only deleter. An unlimited Quill backup count is not that design:
+// protects() keeps name.N.log live, Quill renames the whole chain, and a live stream
+// would grow without a bound.
 uint32_t backupCount(const uOS::LogLimits& limits) {
     const auto bytes = rotationBytes(limits);
     std::uintmax_t byBytes = bytes == 0 ? 1 : limits.maxFolderBytes / bytes;
@@ -396,8 +406,13 @@ quill::RotatingFileSinkConfig rotatingConfig(const uOS::LogLimits& limits) {
     cfg.set_rotation_max_file_size(static_cast<std::size_t>(capped));
     cfg.set_max_backup_files(backupCount(limits));
     cfg.set_rotation_naming_scheme(quill::RotatingFileSinkConfig::RotationNamingScheme::Index);
-    cfg.set_open_mode("a");
-    cfg.set_fsync_enabled(true);
+    // Each path is unique, so there is no earlier index chain to recover or delete.
+    // "w" with remove_old_files(false) skips Quill's open-time directory walk.
+    cfg.set_open_mode("w");
+    cfg.set_remove_old_files(false);
+    // Routine fsync stays off. A zero minimum interval would fsync every backend flush
+    // and stall callers when the queue fills. The crash path fsyncs the trace itself.
+    // Quill still fsyncs before it renames a segment.
     return cfg;
 }
 
@@ -419,25 +434,10 @@ void logStdio(const std::string& line) {
         return;
     }
     const auto level = static_cast<uOS::LogLevel>(g_systemFileLevel.load(std::memory_order_relaxed));
-    if (level == uOS::LogLevel::LOG_TRACE_L3) {
-        QUILL_LOG_TRACE_L3(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_TRACE_L2) {
-        QUILL_LOG_TRACE_L2(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_TRACE_L1) {
-        QUILL_LOG_TRACE_L1(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_DEBUG) {
-        QUILL_LOG_DEBUG(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_INFO) {
-        QUILL_LOG_INFO(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_NOTICE) {
-        QUILL_LOG_NOTICE(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_WARNING) {
-        QUILL_LOG_WARNING(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_ERROR) {
-        QUILL_LOG_ERROR(g_stdio, "{}", line);
-    } else if (level == uOS::LogLevel::LOG_CRITICAL) {
-        QUILL_LOG_CRITICAL(g_stdio, "{}", line);
+    if (level == uOS::LogLevel::LOG_NONE) {
+        return;
     }
+    QUILL_LOG_DYNAMIC(g_stdio, toQuill(level), "{}", line);
 }
 
 #ifdef uOS_ENABLE_TUI
@@ -611,15 +611,23 @@ void drainFd(int fd) {
     }
 }
 
+void reRaise(int sig) {
+    std::signal(sig, SIG_DFL);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, sig);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+    raise(sig);
+}
+
 void onAlarm(int) {
     const int sig = g_crashSig.load(std::memory_order_relaxed);
-    const int original = sig == 0 ? SIGABRT : sig;
-    std::signal(original, SIG_DFL);
-    raise(original);
+    reRaise(sig == 0 ? SIGABRT : sig);
 }
 
 void crashHandler(int sig) {
     if (g_inCrash.test_and_set(std::memory_order_acq_rel)) {
+        reRaise(sig);
         return;
     }
     g_crashSig.store(sig, std::memory_order_relaxed);
@@ -632,21 +640,6 @@ void crashHandler(int sig) {
     if (g_teeOn) {
         drainFd(g_outPipe[0]);
         drainFd(g_errPipe[0]);
-    }
-
-    if (g_backendUp.load(std::memory_order_acquire) && !quill::Logger::is_current_thread_backend_thread()) {
-        if (auto* logger = uOS::systemLog().native()) {
-            try {
-                logger->flush_log(0);
-            } catch (...) {
-            }
-        }
-        if (g_stdio != nullptr) {
-            try {
-                g_stdio->flush_log(0);
-            } catch (...) {
-            }
-        }
     }
 
     const char* name = "signal";
@@ -667,6 +660,8 @@ void crashHandler(int sig) {
             break;
     }
 
+    // TODO: replace backward-cpp here with an async-signal-safe trace. StackTrace and the
+    // ostringstream allocate, which is not safe in a signal handler.
     backward::StackTrace st;
     st.load_here(32);
     backward::Printer printer;
@@ -700,7 +695,6 @@ void installCrashSignals() {
     struct sigaction action{};
     action.sa_handler = crashHandler;
     sigemptyset(&action.sa_mask);
-    sigaddset(&action.sa_mask, SIGALRM);
     for (int sig : {SIGSEGV, SIGABRT, SIGILL, SIGBUS}) {
         sigaction(sig, &action, nullptr);
     }
@@ -762,8 +756,12 @@ void attachCapture(const std::shared_ptr<quill::Sink>& sink) {
     }
 }
 
-uOS::LogStream makeStream(const std::filesystem::path& folder, const std::filesystem::path& path, std::string loggerName, std::string typeName,
-                          uint16_t viewId, uOS::LogLimits limits, bool system, uOS::TaskId id) {
+} // namespace
+
+namespace uOS {
+
+LogStream Logger::makeStream(const std::filesystem::path& folder, const std::filesystem::path& path, std::string loggerName, std::string typeName,
+                             uint16_t viewId, LogLimits limits, bool system, TaskId id) {
     (void)viewId;
     ASSERT_FOR_FATAL(ensureWritableDir(folder));
     quill::FileEventNotifier notifier;
@@ -805,9 +803,10 @@ uOS::LogStream makeStream(const std::filesystem::path& folder, const std::filesy
         }
         logger = quill::Frontend::create_logger(loggerName, std::move(sinks), logPattern(), quill::ClockSourceType::System);
     }
-    logger->set_log_level(toQuill(uOS::LogLevel::LOG_INFO));
+    logger->set_log_level(toQuill(LogLevel::LOG_INFO));
     if (system) {
         g_systemFileSink = fileSink;
+        detail::systemLogger.store(logger, std::memory_order_release);
     }
 
     auto impl = std::make_shared<uOS::LogStream::Impl>();
@@ -819,12 +818,8 @@ uOS::LogStream makeStream(const std::filesystem::path& folder, const std::filesy
     impl->folder = folder;
     impl->limits = limits;
     impl->system = system;
-    return uOS::LogStream{std::move(impl)};
+    return LogStream{std::move(impl)};
 }
-
-} // namespace
-
-namespace uOS {
 
 LogStream::LogStream() noexcept = default;
 LogStream::~LogStream() = default;
@@ -895,10 +890,7 @@ void LogStream::flush() const {
     }
 }
 
-LogStream systemLog() {
-    std::lock_guard lock(g_taskMu);
-    return g_systemStream;
-}
+const LogStream& systemLog() { return g_systemStream; }
 
 void prepareLogThread() { quill::Frontend::preallocate(); }
 
@@ -999,6 +991,7 @@ void Logger::start(void) {
 }
 
 void Logger::stop(void) {
+    // Flush while the widget and the backend are both still alive.
     if (auto sys = systemLog()) {
         sys.flush();
     }
@@ -1017,6 +1010,7 @@ void Logger::stop(void) {
     }
 
 #ifdef uOS_ENABLE_TUI
+    // Join finalcut before restoring stdout. exec() still writes through the tee.
     if (g_tui) {
         g_tui->quit();
         if (g_tuiThread.joinable()) {
@@ -1025,6 +1019,12 @@ void Logger::stop(void) {
     }
 #endif
     stopTee();
+    // TuiSink::write_log runs only on the backend thread. Publish that the widget is
+    // going away, join that thread, and only then delete it.
+    g_tuiOn.store(false, std::memory_order_release);
+    detail::systemLogger.store(nullptr, std::memory_order_release);
+    g_backendUp.store(false, std::memory_order_release);
+    quill::Backend::stop();
 #ifdef uOS_ENABLE_TUI
     if (g_tui) {
         finalcut::FTermcap::setDefaultPutCharFunction();
@@ -1032,11 +1032,8 @@ void Logger::stop(void) {
         delete g_tui;
         g_tui = nullptr;
         g_tuiView = nullptr;
-        g_tuiOn = false;
     }
 #endif
-    g_backendUp.store(false, std::memory_order_release);
-    quill::Backend::stop();
 }
 
 LogStream Logger::openTask(std::string_view actorName, std::string_view instName, TaskId id, LogLimits limits) {

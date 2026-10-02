@@ -21,6 +21,35 @@ using namespace std::chrono_literals;
 
 namespace uOS {
 
+namespace {
+
+volatile std::sig_atomic_t g_stopSignal = 0;
+
+void logStopSignal() {
+    if (g_stopSignal == 0) {
+        return;
+    }
+    switch (g_stopSignal) {
+        case SIGINT:
+            SLOG(LogLevel::LOG_WARNING, "SIGINT received, stopping FW");
+            break;
+        case SIGTERM:
+            SLOG(LogLevel::LOG_WARNING, "SIGTERM received, stopping FW");
+            break;
+        case SIGHUP:
+            SLOG(LogLevel::LOG_WARNING, "SIGHUP received, stopping FW");
+            break;
+        case SIGQUIT:
+            SLOG(LogLevel::LOG_WARNING, "SIGQUIT received, stopping FW");
+            break;
+        default:
+            SLOG(LogLevel::LOG_ERROR, "Unknown signal received: {}", static_cast<int>(g_stopSignal));
+            break;
+    }
+}
+
+} // namespace
+
 #ifdef uOS_ENABLE_CLI
 // required for forward decleration
 std::unique_ptr<cli::Cli> FW::_cli;
@@ -326,6 +355,8 @@ int32_t FW::run() {
         wakeup += 20ms;
         std::this_thread::sleep_until(wakeup);
     }
+
+    logStopSignal();
 
 #ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
     // sync task thread pool cleanup
@@ -897,27 +928,10 @@ void FW::_handleDelete(void) // todo: inline yap
 }
 
 void FW::_sigintHandler(int signum) {
-    // log the signal type
-    switch (signum) {
-        case SIGINT:
-            SLOG(LogLevel::LOG_WARNING, "SIGINT received, stopping FW");
-            break;
-        case SIGTERM:
-            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
-            break;
-        case SIGHUP:
-            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
-            break;
-        case SIGQUIT:
-            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
-            break;
-        default:
-            SLOG(LogLevel::LOG_ERROR, "Unknown signal received: {}", signum);
-            break;
-    }
-
-    // stop the FW
-    kill();
+    // No SLOG here. systemLog and Quill are not safe to call from a signal handler.
+    // The run thread logs g_stopSignal after the loop sees _isRunning == false.
+    g_stopSignal = signum;
+    _isRunning = false;
 }
 
 #ifdef uOS_ENABLE_CLI

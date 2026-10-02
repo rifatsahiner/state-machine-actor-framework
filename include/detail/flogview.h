@@ -2,6 +2,8 @@
 #ifndef F_LOG_VIEW_H
 #define F_LOG_VIEW_H
 
+#include "uOS_defs.h"
+
 #include <final/final.h>
 
 class FLogViewBase : public finalcut::FDialog
@@ -12,19 +14,7 @@ class FLogViewBase : public finalcut::FDialog
 
     void registerOnQuit(std::function<void(void)>);
 
-    enum class LogLevel : uint8_t {
-      LOG_TRACE_L3 = 0,
-      LOG_TRACE_L2,
-      LOG_TRACE_L1,
-      LOG_TRACE = LOG_TRACE_L1,
-      LOG_DEBUG,
-      LOG_INFO,
-      LOG_NOTICE,
-      LOG_WARNING,
-      LOG_ERROR,
-      LOG_CRITICAL,
-      LOG_NONE = 10
-    };
+    using LogLevel = uOS::LogLevel;
 
   private:
     void _printLog(const std::wstring&, LogLevel, std::string::size_type = std::string::npos);
