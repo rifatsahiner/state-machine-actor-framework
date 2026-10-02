@@ -15,6 +15,8 @@
 
 #include "uOS.h"
 
+#include "detail/logger.h"
+
 using namespace std::chrono_literals;
 
 namespace uOS {

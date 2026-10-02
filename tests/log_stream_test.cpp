@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -73,6 +75,16 @@ public:
     void go() { LOG(uOS::LogLevel::LOG_INFO, "from-child"); }
 
 private:
+    HandleResult _topInitialTrans(void) override { return HandleResult::Ignored; }
+};
+
+class NamedTask : public uOS::SyncTask {
+public:
+    NamedTask(uOS::TaskId id, std::string inst) : SyncTask(id, std::move(inst)) {}
+
+private:
+    std::string _getTaskName(void) const override { return "NamedTask"; }
+    std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const override { return {}; }
     HandleResult _topInitialTrans(void) override { return HandleResult::Ignored; }
 };
 
@@ -153,6 +165,13 @@ int main() {
     uOS::Logger::detachTask(11);
     (void)second;
     expect(fileCount(root / "SweepTask") == 1, "folder file cap deletes the oldest closed file");
+
+    const uOS::TaskId namedId = uOS::FW::createTask<NamedTask>("n1");
+    uOS::FW::deleteTask(namedId);
+    const fs::path named = newest(root / "NamedTask");
+    expect(!named.empty(), "createTask opens a folder from _getTaskName");
+    expect(contains(named, "Instance n1 is initialized"), "init line uses the instance name");
+    expect(contains(named, "NamedTask/n1"), "logger name uses the virtual type name");
 
     uOS::Logger::stop();
 

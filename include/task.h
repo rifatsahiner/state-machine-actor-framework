@@ -43,7 +43,7 @@ public:
     ~Task();
 
 protected:
-    Task(TaskId, std::string instName, LogStream log);
+    Task(TaskId, std::string instName);
 
     Task(const Task& other) = delete;
     Task& operator=(const Task& rhs) = delete;
@@ -81,6 +81,7 @@ protected:
     }
 
 private:
+    virtual std::string _getTaskName(void) const = 0;
     virtual std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const = 0;
     std::string _instName;
     std::string _taskName;

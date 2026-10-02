@@ -14,7 +14,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "detail/logger.h"
 #include "task.h"
 
 #ifdef uOS_ENABLE_CLI
@@ -158,18 +157,15 @@ public:
         decltype(_taskMap)::iterator iter;
 
         static_assert(std::is_base_of_v<Task, T>);
-        static_assert(std::is_convertible_v<decltype(T::actorName), std::string_view>,
-                      "task type must define static constexpr std::string_view actorName");
 
         {
             std::lock_guard lock(_taskMutex);
             bool result;
 
             TaskId newTaskId = FW::_getAvailableTaskId();
-            LogStream stream = Logger::openTask(T::actorName, taskName, newTaskId);
 
-            std::tie(iter, result) = _taskMap.try_emplace(
-                newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::move(stream), std::forward<TaskArgs>(taskArgs)...));
+            std::tie(iter, result) =
+                _taskMap.try_emplace(newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
             ASSERT_FOR_FATAL(result == true);
             if (auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(iter->second)) {
                 _syncTaskList.push_back(std::move(syncTaskPtr));

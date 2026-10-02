@@ -1,18 +1,20 @@
 
 #include "uOS.h"
 
+#include "detail/logger.h"
 
 namespace uOS {
 
 
-Task::Task(const TaskId taskId, std::string taskInstName, LogStream log)
-    : _id{taskId}, _instName{std::move(taskInstName)}, _taskName{std::string(log.typeName())}, _log{std::move(log)} {}
+Task::Task(const TaskId taskId, std::string taskInstName) : _id{taskId}, _instName{std::move(taskInstName)} {}
 
 Task::~Task() {
     Logger::detachTask(_id);
 }
 
 void Task::init(void){
+    _taskName = _getTaskName();
+    _log = Logger::openTask(_taskName, _instName, _id);
     _stateNameMap = _getStateNameMap();
 
     LOG(LogLevel::LOG_INFO, "Instance {} is initialized", _instName);
