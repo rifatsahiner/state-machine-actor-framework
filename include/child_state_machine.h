@@ -5,6 +5,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "log_stream.h"
 #include "state_machine.h"
 
 namespace uOS {
@@ -20,15 +21,18 @@ public:
     ChildStateMachine& operator=(ChildStateMachine&&) = delete;
 
 protected:
-    explicit ChildStateMachine(TaskId parentTaskId)
+    ChildStateMachine(TaskId parentTaskId, LogStream log)
         requires std::is_void_v<Shared>
-        : _parentTaskId(parentTaskId) {}
+        : _parentTaskId(parentTaskId), _log(std::move(log)) {}
 
     template <class S = Shared>
         requires(!std::is_void_v<S> && std::is_same_v<S, Shared>)
-    ChildStateMachine(std::type_identity_t<S>& shared, TaskId parentTaskId) : _parentTaskId(parentTaskId), _shared(&shared) {}
+    ChildStateMachine(std::type_identity_t<S>& shared, TaskId parentTaskId, LogStream log)
+        : _parentTaskId(parentTaskId), _log(std::move(log)), _shared(&shared) {}
 
     TaskId parentTaskId() const noexcept { return _parentTaskId; }
+
+    LogStream logStream() const { return _log; }
 
     void postToParent(std::shared_ptr<const Event> event) const { FW::postEvent(_parentTaskId, std::move(event)); }
 
@@ -52,6 +56,7 @@ private:
     struct EmptyShared {};
 
     TaskId _parentTaskId{};
+    LogStream _log;
     std::conditional_t<std::is_void_v<Shared>, EmptyShared, Shared*> _shared{};
 };
 

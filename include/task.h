@@ -5,10 +5,12 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
-#include "detail/logger.h"
+#include "log_stream.h"
 #include "state_machine.h"
 #ifdef uOS_ENABLE_CLI
 #include "detail/json_fwd.h"
@@ -30,6 +32,7 @@ public:
     virtual void putEvent(std::shared_ptr<const Event>&&) = 0;
     std::string getName(void) const;
     std::string_view getState(void) const;
+    void setLogLevels(LogLevel fileLevel, LogLevel uiLevel) { _log.setLevels(fileLevel, uiLevel); }
 #ifndef NDEBUG
     virtual bool isIdle(void) = 0;
 #endif
@@ -40,7 +43,7 @@ public:
     ~Task();
 
 protected:
-    Task(const TaskId, const std::string&); // todo: bu kontrol edilecek std::string&& olması daha uygun
+    Task(TaskId, std::string instName, LogStream log);
 
     Task(const Task& other) = delete;
     Task& operator=(const Task& rhs) = delete;
@@ -62,6 +65,7 @@ protected:
     TimerId _selfPostEvery(uint_fast16_t intervalMs, std::shared_ptr<const Event>);
     virtual void _selfStop(void) = 0;
     virtual void _selfDelete(void) = 0;
+    LogStream logStream() const { return _log; }
 #ifdef uOS_ENABLE_CLI
     void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 #endif
@@ -77,24 +81,12 @@ protected:
     }
 
 private:
-    // task name and state-name map will be provided from tasks
-    virtual std::string _getTaskName(void) const = 0;
     virtual std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const = 0;
     std::string _instName;
     std::string _taskName;
+    LogStream _log;
     std::vector<std::pair<State, std::string_view>>
         _stateNameMap; // couldnt make State work as a key for unordered_map or map, so using vector of pairs
-
-protected:
-    template <typename... LogStrArgs>
-    void log__(const char* file, const char* function, int line, LogLevel level, fmt::format_string<LogStrArgs...> logStr,
-               LogStrArgs&&... logStrArgs) {
-        // format logStr
-        auto formattedStr = fmt::format(logStr, std::forward<LogStrArgs>(logStrArgs)...);
-
-        // sent to logger
-        Logger::logTask(file, function, line, level, formattedStr, _id, _taskName + '-' + _instName);
-    }
 };
 
 class AsyncTask : public Task {

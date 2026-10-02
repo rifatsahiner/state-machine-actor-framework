@@ -19,8 +19,6 @@ FLogViewBase::FLogViewBase(finalcut::FWidget* parent, uint_fast16_t logSize) : f
     _buttonClear.setForegroundColor(finalcut::FColor::White);
     _buttonClear.setFocusForegroundColor(finalcut::FColor::White);
 
-    _info.setChecked();
-
     _lineEditFilter.setLabelText(L"Filter");
     _lineEditFilter.setLabelOrientation(finalcut::FLineEdit::LabelOrientation::Above);
     _lineEditFilter.unsetShadow();
@@ -37,15 +35,8 @@ FLogViewBase::FLogViewBase(finalcut::FWidget* parent, uint_fast16_t logSize) : f
     // clear button
     _buttonClear.setGeometry(finalcut::FPoint{14,2}, finalcut::FSize{7, 1});
 
-    // button group
-    _radiobutton_group.setGeometry(finalcut::FPoint{23,1}, finalcut::FSize{25, 3});
-    _error.setGeometry(finalcut::FPoint{1,1}, finalcut::FSize{5, 1});
-    _warning.setGeometry(finalcut::FPoint{7,1}, finalcut::FSize{5, 1});
-    _info.setGeometry(finalcut::FPoint{13,1}, finalcut::FSize{5, 1});
-    _trace.setGeometry(finalcut::FPoint{19,1}, finalcut::FSize{5, 1});
-
     // filter box
-    _lineEditFilter.setGeometry(finalcut::FPoint{49,2}, finalcut::FSize{12, 3});
+    _lineEditFilter.setGeometry(finalcut::FPoint{23,2}, finalcut::FSize{16, 3});
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -107,40 +98,38 @@ void FLogViewBase::_adjust(void) {
 
 void FLogViewBase::_printLog(const std::wstring& logLine, LogLevel logLevel, std::string::size_type hglPos){
     finalcut::FString logLineFstring{logLine};
+    _textView.append(logLineFstring);
 
+    finalcut::FColor bg = finalcut::FColor::Blue;
     switch (logLevel) {
-    case LogLevel::LOG_TRACE:
-        logLineFstring.insert(L"[TRACE]   ", 0);
-        _textView.append(logLineFstring);    
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{0, 7, finalcut::FColorPair{finalcut::FColor::White, finalcut::FColor::LightGray}});
+    case LogLevel::LOG_TRACE_L3:
+    case LogLevel::LOG_TRACE_L2:
+    case LogLevel::LOG_TRACE_L1:
+    case LogLevel::LOG_DEBUG:
+        bg = finalcut::FColor::LightGray;
         break;
-
     case LogLevel::LOG_INFO:
-        logLineFstring.insert(L"[INFO]    ", 0);
-        _textView.append(logLineFstring);    
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{0, 6, finalcut::FColorPair{finalcut::FColor::White, finalcut::FColor::Blue}});
+    case LogLevel::LOG_NOTICE:
+        bg = finalcut::FColor::Blue;
         break;
-
     case LogLevel::LOG_WARNING:
-        logLineFstring.insert(L"[WARNING] ", 0);
-        _textView.append(logLineFstring);    
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{0, 9, finalcut::FColorPair{finalcut::FColor::White, finalcut::FColor::DarkOrange}});
+        bg = finalcut::FColor::DarkOrange;
         break;
-
     case LogLevel::LOG_ERROR:
-        logLineFstring.insert(L"[ERROR]   ", 0);
-        _textView.append(logLineFstring);    
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{0, 7, finalcut::FColorPair{finalcut::FColor::White, finalcut::FColor::Red}});
+    case LogLevel::LOG_CRITICAL:
+        bg = finalcut::FColor::Red;
         break;
-
     default:
-        _textView.append(L"[UNDEF]    PRINT LOG ATTEMPT WITH UNKNOWN LOG TYPE");    
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{0, 7, finalcut::FColorPair{finalcut::FColor::White, finalcut::FColor::Purple}});
-        return;
+        bg = finalcut::FColor::Purple;
+        break;
+    }
+    if (!logLine.empty()) {
+        _textView.addHighlight(_textView.getLines().size()-1,
+                               finalcut::FTextView::FTextHighlight{0, logLine.size(), finalcut::FColorPair{finalcut::FColor::White, bg}});
     }
 
     if(hglPos != std::string::npos){
-        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{hglPos + 10, _searchString.length(), finalcut::FColorPair{finalcut::FColor::Black, finalcut::FColor::Yellow}});
+        _textView.addHighlight(_textView.getLines().size()-1, finalcut::FTextView::FTextHighlight{hglPos, _searchString.length(), finalcut::FColorPair{finalcut::FColor::Black, finalcut::FColor::Yellow}});
     }
 }
 
@@ -189,17 +178,6 @@ void FLogViewBase::_playButtonCb(void){
     _labelPlay.redraw();
 }
 
-void FLogViewBase::_logLevelClickCb(LogLevel newLogLevel) {
-    if(newLogLevel != _currentLogLevel) {
-        if(static_cast<uint_fast8_t>(newLogLevel) > static_cast<uint_fast8_t>(_currentLogLevel)) {
-            // scroll if needed and redraw logger view
-            _adjustView(true, false);
-        }
-
-        _currentLogLevel = newLogLevel;
-    }
-}
-
 void FLogViewBase::_filter(const LogList& logList) {
     bool clearFlag{false};
     
@@ -243,7 +221,7 @@ void FLogViewBase::_log(LogList& logList, std::wstring&& logLine, LogLevel logLe
             } else {
                 // if search is active than remove oldest log only if it matches the search string
                 const std::wstring& oldestLog = logList.front().logString;
-                if(oldestLog.find(_searchString, oldestLog.find_first_of(L'|', 16) + 3) != std::string::npos){
+                if(oldestLog.find(_searchString) != std::wstring::npos){
                     _textView.deleteLine(0);
                     isShifted = true;
                 }
@@ -261,7 +239,7 @@ void FLogViewBase::_log(LogList& logList, std::wstring&& logLine, LogLevel logLe
             isPrinted = true;
         } else {
             // search is active, print if log matches the search
-            std::string::size_type pos = logLine.find(_searchString, logLine.find_first_of(L'|', 16) + 3);
+            std::string::size_type pos = logLine.find(_searchString);
             if(pos != std::string::npos){
                 _printLog(logLine, logLevel, pos);
                 isPrinted = true;
@@ -282,7 +260,7 @@ void FLogViewBase::_printWithSearch(const LogItem& logItem) {
     if(emptyFlag) {
         _printLog(logItem.logString, logItem.logLevel);
     } else {
-        std::string::size_type pos = logItem.logString.find(_searchString, logItem.logString.find_first_of(L'|', 16) + 3);
+        std::string::size_type pos = logItem.logString.find(_searchString);
         if(pos != std::string::npos){
             _printLog(logItem.logString, logItem.logLevel, pos);
         }
@@ -301,11 +279,6 @@ void FLogViewBase::_printWithSearch(const LogItem& logItem) {
 
 FLogView::FLogView(finalcut::FWidget* parent, uint_fast16_t scrollBackLimit) : FLogViewBase{parent, scrollBackLimit}
 {
-    _trace.addCallback("clicked", this, &FLogView::_logLevelClickCb, LogLevel::LOG_TRACE);
-    _info.addCallback("clicked", this, &FLogView::_logLevelClickCb, LogLevel::LOG_INFO);
-    _warning.addCallback("clicked", this, &FLogView::_logLevelClickCb, LogLevel::LOG_WARNING);
-    _error.addCallback("clicked", this, &FLogView::_logLevelClickCb, LogLevel::LOG_ERROR);
-
     _lineEditFilter.addCallback("changed", this, &FLogView::_filterChangedCb);
 
     _buttonClear.addCallback("clicked", this, &FLogView::clear);
@@ -322,11 +295,6 @@ void FLogView::clear(void) {
 }
 
 void FLogView::log(std::wstring&& logLine, LogLevel logLevel) {
-    // return on low level
-    if(static_cast<uint_fast8_t>(logLevel) < static_cast<uint_fast8_t>(_currentLogLevel)){
-        return;
-    }
-    
     if(_isPlaying == false){
         return;
     }
@@ -343,28 +311,6 @@ void FLogView::_filterChangedCb(void) {
     
     // pass logList for filter
     _filter(_mainLogList);    
-}
-
-void FLogView::_logLevelClickCb(LogLevel newLogLevel) {
-    if(static_cast<uint_fast8_t>(newLogLevel) > static_cast<uint_fast8_t>(_currentLogLevel)) {        
-        // lock logger view access
-        std::lock_guard<std::mutex> lg(_loggerViewMtx);
-        
-        // clear logger view
-        FLogViewBase::clear();
-
-        // remove lower level logs and print others
-        for(auto it = _mainLogList.cbegin(); it != _mainLogList.cend();) {
-            if(static_cast<uint_fast8_t>(it->logLevel) < static_cast<uint_fast8_t>(newLogLevel)) {
-                it = _mainLogList.erase(it);
-            } else {
-                _printWithSearch(*it);
-                it++;
-            }
-        }
-    }
-    // call base class cb
-    FLogViewBase::_logLevelClickCb(newLogLevel);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -385,11 +331,6 @@ FLogViewMulti::FLogViewMulti(finalcut::FWidget* parent, uint_fast16_t scrollBack
     _dropdownViewSelect.unsetEditable();
     _dropdownViewSelect.addCallback("row-changed", this, &FLogViewMulti::_dropdownChangedCb);
     _dropdownViewSelect.addCallback("changed", this, &FLogViewMulti::_dropdownChangedCb);
-
-    _trace.addCallback("clicked", this, &FLogViewMulti::_logLevelClickCb, LogLevel::LOG_TRACE);
-    _info.addCallback("clicked", this, &FLogViewMulti::_logLevelClickCb, LogLevel::LOG_INFO);
-    _warning.addCallback("clicked", this, &FLogViewMulti::_logLevelClickCb, LogLevel::LOG_WARNING);
-    _error.addCallback("clicked", this, &FLogViewMulti::_logLevelClickCb, LogLevel::LOG_ERROR);
 
     _lineEditFilter.addCallback("changed", this, &FLogViewMulti::_filterChangedCb);
 
@@ -458,10 +399,6 @@ void FLogViewMulti::log(std::wstring&& logLine, LogLevel logLevel, uint_fast16_t
         return;
     }
 
-    if(static_cast<uint_fast8_t>(logLevel) < static_cast<uint_fast8_t>(_currentLogLevel)){
-        return;
-    }
-
     // lock logger view access
     std::lock_guard<std::mutex> lg(_loggerViewMtx);
 
@@ -510,34 +447,6 @@ void FLogViewMulti::_adjust(void) {
 //////////////////////////////////////////////////////////////////////
 //                                                                  //
 //////////////////////////////////////////////////////////////////////
-
-void FLogViewMulti::_logLevelClickCb(LogLevel newLogLevel) {
-    if(static_cast<uint_fast8_t>(newLogLevel) > static_cast<uint_fast8_t>(_currentLogLevel)) {
-        // lock logger view access
-        std::lock_guard<std::mutex> lg(_loggerViewMtx);
-        
-        // clear logger view
-        FLogViewBase::clear();
-
-        // iterate over all loglists
-        for(auto viewIter = _viewMap.begin(); viewIter != _viewMap.cend(); viewIter++){
-            bool isActive =  (viewIter->first == _activeViewId);
-            LogList& logList = viewIter->second;
-            for(auto logIter = logList.cbegin(); logIter != logList.cend();) {
-                if(static_cast<uint_fast8_t>(logIter->logLevel) < static_cast<uint_fast8_t>(newLogLevel)) {
-                    logIter = logList.erase(logIter);
-                } else {
-                    if(isActive){
-                        _printWithSearch(*logIter);
-                    }
-                    logIter++;
-                }
-            }
-        }
-    }
-    // call base class cb
-    FLogViewBase::_logLevelClickCb(newLogLevel);
-}
 
 void FLogViewMulti::_filterChangedCb(void) {    
     // pass active logList for filter

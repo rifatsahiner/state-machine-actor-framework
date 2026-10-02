@@ -5,19 +5,15 @@
 namespace uOS {
 
 
-Task::Task(const TaskId taskId, const std::string& taskInstName) : _id{taskId}, _instName{taskInstName} {}
+Task::Task(const TaskId taskId, std::string taskInstName, LogStream log)
+    : _id{taskId}, _instName{std::move(taskInstName)}, _taskName{std::string(log.typeName())}, _log{std::move(log)} {}
 
 Task::~Task() {
-    Logger::removeTaskLogger(_id);
+    Logger::detachTask(_id);
 }
 
 void Task::init(void){
-    // get task specific data from overriden functions
-    _taskName = _getTaskName();
     _stateNameMap = _getStateNameMap();
-
-    // register task to logger
-    Logger::addTaskLogger(_id, _taskName, _instName);
 
     LOG(LogLevel::LOG_INFO, "Instance {} is initialized", _instName);
 

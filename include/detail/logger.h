@@ -1,83 +1,47 @@
-
 #ifndef LOGGER_H
 #define LOGGER_H
 
-#include <string>
-#include <thread>
-#include <functional>
+#include "log_stream.h"
+
+#include <cstdint>
 #include <filesystem>
-#include <fstream>
-#include <shared_mutex>
-
-#include <fmt/format.h>
-
-#include "uOS_defs.h"
-
-#ifdef uOS_ENABLE_TUI
-class FLogView;
-class FLogViewMulti;
-namespace finalcut { class FApplication; }
-#endif
-
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace uOS {
 
-
-class Logger {
-    public:
-        static void init(int, char*[], const std::string& appName = "uOS",
-                         std::optional<std::function<void(void)>> = std::nullopt);
-        static void start(void);
-        static void stop(void);
-        static void addTaskLogger(const TaskId, const std::string&, const std::string&);
-        static void removeTaskLogger(const TaskId);
-        static void logFw(const char*, const char*, const int, const LogLevel, const std::string&);
-        static void logTask(const char*, const char*, int, LogLevel, const std::string&, TaskId, std::string_view);
-        static bool isActive(void);
-    
-    private:
-        struct TaskLogStream {
-            std::ofstream fileStream;
-            std::mutex fileMutex;
-            const std::filesystem::path folderPath;
-            const std::string fileName;
-            uint_fast32_t fileLineCount = 0;
-            uint_fast8_t overflowCount = 0;
-
-            TaskLogStream(std::ofstream&& stream, std::filesystem::path&& path, std::string&& file) : fileStream(std::move(stream)), folderPath(std::move(path)), fileName(std::move(file)) { }
-        };
-
-#ifdef uOS_ENABLE_TUI
-        static inline finalcut::FApplication* _tui {nullptr};
-        static inline FLogView* _loggerFw;
-        static inline FLogViewMulti* _loggerTasks;
-        static inline std::thread _loggerThread;
-#endif
-        static inline std::filesystem::path _logFolderPath;
-        static inline std::unordered_map<TaskId, TaskLogStream> _taskFileMap;
-        static inline std::shared_mutex _taskFileMapMutex;
-        static inline std::unique_ptr<TaskLogStream> _systemFile;
-
-        static inline void _logCommon(const char*, const char*, const int, const LogLevel, const std::string&, std::optional<TaskId> = std::nullopt, std::string_view = "");
-        static inline void _fileSizer(TaskLogStream& logStream);
-        static void _systemSignalHandler(int signum);
+struct LogLimits {
+    std::uintmax_t maxFileBytes = 64ull * 1024ull * 1024ull;
+    std::uintmax_t maxFolderBytes = 1024ull * 1024ull * 1024ull;
+    std::size_t maxFolderFiles = 4096;
 };
 
-template <typename... LogStrArgs>
-void log__(const char* file, const char* function, int line, LogLevel level, fmt::format_string<LogStrArgs...> logStr, LogStrArgs&&... logStrArgs) {
-    // if TUI not active and this is TRACE, skip
-    if((Logger::isActive() == false) && level == LogLevel::LOG_TRACE){
-        return;
-    }
-    
-    // format logStr
-    auto formattedStr = fmt::format(logStr, std::forward<LogStrArgs>(logStrArgs)...);
+inline constexpr uint16_t kSystemViewId = 0xFFFE;
 
-    // sent to logger
-    Logger::logFw(file, function, line, level, formattedStr);
-}
+class Logger {
+public:
+    static void init(int argc, char* argv[], const std::string& appName = "uOS", std::optional<std::function<void(void)>> quitCb = std::nullopt);
+    static void start(void);
+    static void stop(void);
 
+    static LogStream openTask(std::string_view actorName, std::string_view instName, TaskId id, LogLimits limits = {});
+    static void detachTask(TaskId id);
 
-}   // namesapce uOS
+    static void setSystemLogLevels(LogLevel fileLevel, LogLevel uiLevel);
+    static void setTaskLogLevels(TaskId id, LogLevel fileLevel, LogLevel uiLevel);
+    static LogLevel systemFileLogLevel();
+    static LogLevel systemUiLogLevel();
+    static LogLevel taskFileLogLevel(TaskId id);
+    static LogLevel taskUiLogLevel(TaskId id);
+
+    static std::filesystem::path logRoot();
+    // Lines handed to the TUI or the console since init. Empty unless UOS_LOG_CAPTURE is set.
+    static std::vector<std::string> capturedUi();
+};
+
+} // namespace uOS
 
 #endif

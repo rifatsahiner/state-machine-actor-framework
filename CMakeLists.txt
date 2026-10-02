@@ -19,6 +19,7 @@ message(STATUS "Current build type: ${CMAKE_BUILD_TYPE}")
 # TUI and CLI are opt-in: off by default so a regular build does not pull their deps.
 option(uOS_ENABLE_TUI "Build with TUI support (finalcut, gpm, ncurses)" OFF)
 option(uOS_ENABLE_CLI "Build with CLI support (cli, nlohmann/json, asio)" OFF)
+option(uOS_BUILD_TESTS "Build the framework test executables" OFF)
 if(uOS_ENABLE_TUI)
     message(STATUS "TUI support: ENABLED")
 else()
@@ -28,6 +29,11 @@ if(uOS_ENABLE_CLI)
     message(STATUS "CLI support: ENABLED")
 else()
     message(STATUS "CLI support: DISABLED (enable with -DuOS_ENABLE_CLI=ON)")
+endif()
+if(uOS_BUILD_TESTS)
+    message(STATUS "Framework tests: ENABLED")
+else()
+    message(STATUS "Framework tests: DISABLED (enable with -DuOS_BUILD_TESTS=ON)")
 endif()
 
 # Set target
@@ -105,19 +111,15 @@ if(uOS_ENABLE_CLI)
     get_target_property(JSON_INCLUDE_DIR nlohmann_json::nlohmann_json INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
-############ FMT ############ update!!
-find_package(fmt 12.2 QUIET)
-if(fmt_FOUND)
-    message(STATUS "fmt found via find_package")
-else()
-    message(STATUS "fmt not found. Fetching from source.")
-    FetchContent_Declare(fmt
-        GIT_REPOSITORY https://github.com/fmtlib/fmt
-        GIT_TAG 12.2.0
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    set(FMT_INSTALL ON CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(fmt)
-endif()
+############ QUILL ############
+set(QUILL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(QUILL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(QUILL_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(quill
+    GIT_REPOSITORY https://github.com/odygrd/quill.git
+    GIT_TAG v13.0.0
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(quill)
 
 ############ FINALCUT (optional TUI) ############
 if(uOS_ENABLE_TUI)
@@ -237,12 +239,14 @@ if(uOS_ENABLE_CLI)
 endif()
 target_include_directories(${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${INCLUDE_DIR}>
-    $<INSTALL_INTERFACE:include/uOS>)
+    $<BUILD_INTERFACE:${quill_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include/uOS>
+    $<INSTALL_INTERFACE:include>)
+target_compile_definitions(${PROJECT_NAME} PUBLIC QUILL_DISABLE_NON_PREFIXED_MACROS)
 
 # link libraries
 find_package(Threads REQUIRED)
 target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
-target_link_libraries(${PROJECT_NAME} PUBLIC fmt::fmt)
 # BUILD_INTERFACE: uOS is static, so a PRIVATE dep would otherwise be
 # exported and cmake --install would demand an exported backward_interface.
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -273,6 +277,8 @@ install(DIRECTORY ${INCLUDE_DIR}/
         DESTINATION include/uOS
         FILES_MATCHING PATTERN "*.h"
         ${UOS_HEADER_EXCLUDES})
+install(DIRECTORY ${quill_SOURCE_DIR}/include/quill
+        DESTINATION include)
 
 # Install the library and export targets
 set(UOS_INSTALL_TARGETS ${PROJECT_NAME})
@@ -327,7 +333,7 @@ elseif(_uos_bw_backend STREQUAL "dwarf")
 endif()
 string(REPLACE ";" " " UOS_PC_REQUIRES_PRIVATE "${_uos_pc_requires}")
 string(REPLACE ";" " " UOS_PC_LIBS_PRIVATE "${_uos_pc_libs}")
-set(UOS_PC_EXTRA_CFLAGS "")
+set(UOS_PC_EXTRA_CFLAGS "-DQUILL_DISABLE_NON_PREFIXED_MACROS ")
 if(uOS_ENABLE_TUI)
     string(APPEND UOS_PC_EXTRA_CFLAGS "-DuOS_ENABLE_TUI ")
 endif()
@@ -342,21 +348,18 @@ configure_file(
 install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
         DESTINATION lib/pkgconfig)
 
+if(uOS_BUILD_TESTS)
+    add_executable(log_stream_test tests/log_stream_test.cpp)
+    target_link_libraries(log_stream_test PRIVATE ${PROJECT_NAME})
+endif()
+
 
 
 # Task -> Actor
 # on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
-# task'ların alt komponentlerine (ör: child state machine yada tcp/sctp objesi gibi) log stream'lerini yollayabilmesi icin bir yol olustur. Bunu alt madde ile birlikte düşün
-    # bu yapıldıktan soran StateMachine'den ChildSm diye bir class extend et. Bu parent actor id ve parent actor log stream'ini alacak
-    # actor'e friend olabilir, benzer şekilde parent'ın resource'larını kullanabileceği bir yapı kurulabilir. Child SM ihtiyacı olduğunda bunu kullanacak
-    # actor de create_child_sm diye bir fonksiyon olablir, _id ve _logStream'i otomatik geçer. Burada shared_ref_collection gibi bir obje yerine liste olarak paylaşılacak objeleri girebilir miyim?
-# tum loglama isini spdlog'a cevir
-    # reset durumunda (segfault, sigabort vs.) stdout ve stderr flush yapacak kodu ekle -> spdlog'a yaptir
-    # set FW and console debug level from CLI -> suanda trace loglar dosyaya ve console'a yazilmiyor. bu seviye global olarak belirlenecek
-    # tui log seviyesi ayrica belirlenecek. basilacak bir log iki seviyeden de kucukse log kodlarına hic girilmeden return edilecek
-    # bunlarin default degerleri info olacak, baslangicta --log-level ile set edilebilecek
-    # task'lar log stream'lerini başka objelere yollayabilecek, child state machine'lar, tcp/sctp kütüphaneleri de task stream'ine loglayabilmeli
 # timer id hiçbir zaman 0 vermeyecek şekilde değiştirilecek
+# Tasklara create-child-SM benzeri bir function template tanımlanabilir mi düşünülecek -> log stream kullananlar task constructor'ından çağırılmaması gerekiyor
+# CLI ve _getStateNameMap tekrar değerlendirilecek. _getStateNameMap kullanılmıyorsa kaldırılacak
 # task queue icin moodycamel::ConcurrentQueue dene
 # AI uygulama usr/bin klasörüne yüklendiğinde orada LOG klasörü yaratamayacağı için XDG_STATE_HOME diye bir yere koydu logları. Burayı düzelt
 # reduce standard requirement to c++17
@@ -364,7 +367,6 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 # diğer işlerden önce fark edilmek için example ekle
 # sistemdeki eventleri izlemek için bir tool yazılımı yapılacak (AI ile yap)
 # --no-signal-handle ve --no-terminal-log ekle
-# bir klasorde 10k yada 20k dan fazla log dosyası olmasını engelle, 33k dosya varken bu sekilde bir hata aldim
 # add fetch and install for asio too
 # auto install for dependencies is not recommended. so provide an option to install all or just uOS and make just uOS as rcommended option
 # add option for building shared library

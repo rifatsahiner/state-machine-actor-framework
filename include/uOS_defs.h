@@ -79,16 +79,21 @@ const T& recast_e(const Event& eventRef) {
     return static_cast<const T&>(eventRef);
 }
 
-// log levels
-enum class LogLevel : uint_fast8_t {
-    LOG_TRACE = 0,
+// Same values as quill::LogLevel, minus Backtrace. LOG_TRACE is TRACE_L1.
+// LOG_NONE is a threshold that drops every statement.
+enum class LogLevel : uint8_t {
+    LOG_TRACE_L3 = 0,
+    LOG_TRACE_L2,
+    LOG_TRACE_L1,
+    LOG_TRACE = LOG_TRACE_L1,
+    LOG_DEBUG,
     LOG_INFO,
+    LOG_NOTICE,
     LOG_WARNING,
-    LOG_ERROR
+    LOG_ERROR,
+    LOG_CRITICAL,
+    LOG_NONE = 10
 };
-
-// log macro
-#define LOG(logLevel, logStr, ...) log__(__FILE__, __func__, __LINE__, logLevel, logStr, ##__VA_ARGS__)
 
 // define the unreachable intrinsic based on compiler
 #if defined(_MSC_VER)

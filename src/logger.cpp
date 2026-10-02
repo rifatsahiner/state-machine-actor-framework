@@ -1,108 +1,292 @@
+// Quill owns rotating files and, when the TUI is off, the console.
+// Each line is formatted once: neither the console sink nor the TUI sink
+// sets its own pattern, so both receive the same log_statement.
+// Still ours: the TUI widget and its UTF-8 conversion, the TUI-only stdout/stderr
+// capture (finalcut keeps the terminal; printf and fprintf are stored in the
+// system file at the current system file level), the crash handler plus
+// backward-cpp, and the folder deletion sweep.
 
 #include "detail/logger.h"
+
 #ifdef uOS_ENABLE_TUI
 #include "detail/flogview.h"
+
+#include <final/output/tty/ftermcap.h>
 #endif
+
 #include <backward.hpp>
-#include <ctime>
+
+#include "quill/Backend.h"
+#include "quill/Frontend.h"
+#include "quill/LogMacros.h"
+#include "quill/Logger.h"
+#include "quill/bundled/fmt/format.h"
+#include "quill/filters/Filter.h"
+#include "quill/sinks/ConsoleSink.h"
+#include "quill/sinks/RotatingFileSink.h"
+
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <csignal>
-#include <cstdlib>
-#include <system_error>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
+#include <filesystem>
+#include <limits>
+#include <mutex>
+#include <poll.h>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
-// #include <syncstream>
 
-namespace { // anonymous namespace for internal linkage
+namespace {
 
+std::atomic<bool> g_backendUp{false};
+std::atomic<int> g_crashSig{0};
+std::atomic_flag g_inCrash = ATOMIC_FLAG_INIT;
+std::atomic<uint8_t> g_systemFileLevel{static_cast<uint8_t>(uOS::LogLevel::LOG_INFO)};
 
-constexpr std::uintmax_t MAX_TASK_LOG_FOLDER_SIZE = 1024 * 1024 * 1024; // 1 GB
-constexpr uint_fast32_t MAX_FILE_LOG_LINE_COUNT = 300 * 1000; // 300K lines
-// constexpr std::uintmax_t MAX_TASK_LOG_FOLDER_SIZE = 1024 * 1024;
-// constexpr uint_fast32_t MAX_FILE_LOG_LINE_COUNT = 20;
+int g_savedOut = -1;
+int g_savedErr = -1;
+int g_outPipe[2] = {-1, -1};
+int g_errPipe[2] = {-1, -1};
+std::thread g_tee;
+bool g_teeOn = false;
+
+std::mutex g_liveMu;
+std::unordered_set<std::string> g_live;
+
+std::mutex g_captureMu;
+std::vector<std::string> g_capture;
+bool g_captureOn = false;
+
+std::mutex g_taskMu;
+std::unordered_map<uOS::TaskId, uOS::LogStream> g_tasks;
+uOS::LogStream g_systemStream;
+std::filesystem::path g_systemPath;
+std::shared_ptr<quill::Sink> g_systemFileSink;
+quill::Logger* g_stdio = nullptr;
 
 #ifdef uOS_ENABLE_TUI
-void tuiThreadFunc(void) {
-    finalcut::FApplication::getApplicationObject()->exec();
-}
+finalcut::FApplication* g_tui = nullptr;
+FLogViewMulti* g_tuiView = nullptr;
+std::thread g_tuiThread;
 #endif
+bool g_tuiOn = false;
 
-constexpr std::string_view _logLevelToString(uOS::LogLevel level) {
-    switch (level) {
-        case uOS::LogLevel::LOG_TRACE: return "TRACE   ";
-        case uOS::LogLevel::LOG_INFO: return "INFO    ";
-        case uOS::LogLevel::LOG_WARNING: return "WARNING ";
-        case uOS::LogLevel::LOG_ERROR: return "ERROR   ";
-        default: return "UNKNOWN";
+std::filesystem::path g_logRoot;
+
+quill::LogLevel toQuill(uOS::LogLevel level) { return static_cast<quill::LogLevel>(level); }
+
+uOS::LogLevel quieter(uOS::LogLevel a, uOS::LogLevel b) { return static_cast<uint8_t>(a) < static_cast<uint8_t>(b) ? a : b; }
+
+quill::PatternFormatterOptions logPattern() {
+    return quill::PatternFormatterOptions{"%(time) %(log_level:<8) %(logger) %(short_source_location) %(message)", "%Y-%m-%d %H:%M:%S.%Qus",
+                                          quill::Timezone::LocalTime};
+}
+
+void writeAllFd(int fd, const char* data, std::size_t size) {
+    while (size > 0 && fd >= 0) {
+        const ssize_t n = ::write(fd, data, size);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        data += n;
+        size -= static_cast<std::size_t>(n);
     }
 }
 
-constexpr std::string_view _logLevelToColor(uOS::LogLevel level) {
-    switch (level) {
-        case uOS::LogLevel::LOG_WARNING: return "\033[38;5;208m"; // Orange
-        case uOS::LogLevel::LOG_ERROR: return "\033[31m"; // Red
-        default: return "UNKNOWN-COLOR";
+void noteLive(const std::filesystem::path& path) {
+    std::lock_guard lock(g_liveMu);
+    g_live.insert(path.string());
+}
+
+void noteDead(const std::filesystem::path& path) {
+    std::lock_guard lock(g_liveMu);
+    g_live.erase(path.string());
+}
+
+bool protects(const std::filesystem::path& base, const std::filesystem::path& candidate) {
+    if (base.parent_path() != candidate.parent_path()) {
+        return false;
+    }
+    if (base == candidate) {
+        return true;
+    }
+    const std::string baseName = base.filename().string();
+    const std::string candName = candidate.filename().string();
+    const auto dot = baseName.rfind('.');
+    const std::string stem = dot == std::string::npos ? baseName : baseName.substr(0, dot);
+    const std::string ext = dot == std::string::npos ? std::string{} : baseName.substr(dot);
+    const std::string prefix = stem + ".";
+    if (candName.size() <= prefix.size() + ext.size()) {
+        return false;
+    }
+    if (candName.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    if (candName.compare(candName.size() - ext.size(), ext.size(), ext) != 0) {
+        return false;
+    }
+    const auto index = candName.substr(prefix.size(), candName.size() - prefix.size() - ext.size());
+    return !index.empty() && std::all_of(index.begin(), index.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+
+bool isProtected(const std::filesystem::path& candidate) {
+    for (const auto& live : g_live) {
+        if (protects(live, candidate)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void sweepFolder(const std::filesystem::path& folder, const uOS::LogLimits& limits) {
+    std::lock_guard lock(g_liveMu);
+    std::error_code ec;
+    struct Entry {
+        std::filesystem::path path;
+        std::uintmax_t bytes;
+        std::filesystem::file_time_type when;
+    };
+    std::vector<Entry> files;
+    std::uintmax_t total = 0;
+    for (const auto& dir : std::filesystem::directory_iterator(folder, ec)) {
+        if (ec || !dir.is_regular_file(ec)) {
+            continue;
+        }
+        const auto size = dir.file_size(ec);
+        if (ec) {
+            continue;
+        }
+        files.push_back(Entry{dir.path(), size, dir.last_write_time(ec)});
+        total += size;
+    }
+
+    auto older = [](const Entry& a, const Entry& b) {
+        if (a.when != b.when) {
+            return a.when < b.when;
+        }
+        return a.path.string() < b.path.string();
+    };
+
+    while ((total > limits.maxFolderBytes || files.size() > limits.maxFolderFiles) && !files.empty()) {
+        auto victim = files.end();
+        for (auto it = files.begin(); it != files.end(); ++it) {
+            if (isProtected(it->path)) {
+                continue;
+            }
+            if (victim == files.end() || older(*it, *victim)) {
+                victim = it;
+            }
+        }
+        if (victim == files.end()) {
+            break;
+        }
+        std::error_code rm;
+        std::filesystem::remove(victim->path, rm);
+        if (!rm && total >= victim->bytes) {
+            total -= victim->bytes;
+        }
+        files.erase(victim);
     }
 }
+
+class CaptureFilter : public quill::Filter {
+public:
+    CaptureFilter() : quill::Filter("ui-capture") {}
+
+    bool filter(quill::MacroMetadata const*, uint64_t, std::string_view, std::string_view, std::string_view, quill::LogLevel, std::string_view,
+                std::string_view log_statement) noexcept override {
+        if (!g_captureOn) {
+            return true;
+        }
+        std::string_view line = log_statement;
+        if (!line.empty() && line.back() == '\n') {
+            line.remove_suffix(1);
+        }
+        std::lock_guard lock(g_captureMu);
+        g_capture.emplace_back(line);
+        return true;
+    }
+};
 
 #ifdef uOS_ENABLE_TUI
-// Fast, one‑pass UTF‑8 → wchar_t (assumes wchar_t is at least 32 bits)
-// AI dan copy/paste. kontrol edilecek
-inline std::wstring _utf8ToWstring(const std::string& utf8)
-{
-    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(utf8.data());
-    const unsigned char* end = ptr + utf8.size();
-
+std::wstring utf8ToWstring(std::string_view utf8) {
+    const auto* ptr = reinterpret_cast<const unsigned char*>(utf8.data());
+    const auto* end = ptr + utf8.size();
     std::wstring out;
-    out.reserve(utf8.size());  // worst‑case: 1 byte → 1 wchar_t
-
+    out.reserve(utf8.size());
     while (ptr < end) {
         uint32_t codepoint = 0;
-        size_t    seqlen    = 0;
-        unsigned char lead = *ptr;
-
+        std::size_t seqlen = 0;
+        const unsigned char lead = *ptr;
         if (lead < 0x80) {
             codepoint = lead;
             seqlen = 1;
-        }
-        else if ((lead >> 5) == 0x6) {
-            // if (ptr + 1 >= end) throw std::runtime_error("Invalid UTF-8");
-            if (ptr + 1 >= end) assert(false);
-            codepoint  = (lead & 0x1F) << 6;
+        } else if ((lead >> 5) == 0x6 && ptr + 1 < end) {
+            codepoint = (lead & 0x1F) << 6;
             codepoint |= (ptr[1] & 0x3F);
             seqlen = 2;
-        }
-        else if ((lead >> 4) == 0xE) {
-            // if (ptr + 2 >= end) throw std::runtime_error("Invalid UTF-8");
-            if (ptr + 2 >= end) assert(false);
-            codepoint  = (lead & 0x0F) << 12;
+        } else if ((lead >> 4) == 0xE && ptr + 2 < end) {
+            codepoint = (lead & 0x0F) << 12;
             codepoint |= (ptr[1] & 0x3F) << 6;
             codepoint |= (ptr[2] & 0x3F);
             seqlen = 3;
-        }
-        else if ((lead >> 3) == 0x1E) {
-            // if (ptr + 3 >= end) throw std::runtime_error("Invalid UTF-8");
-            if (ptr + 3 >= end) assert(false);
-            codepoint  = (lead & 0x07) << 18;
+        } else if ((lead >> 3) == 0x1E && ptr + 3 < end) {
+            codepoint = (lead & 0x07) << 18;
             codepoint |= (ptr[1] & 0x3F) << 12;
             codepoint |= (ptr[2] & 0x3F) << 6;
             codepoint |= (ptr[3] & 0x3F);
             seqlen = 4;
+        } else {
+            codepoint = '?';
+            seqlen = 1;
         }
-        else {
-            // throw std::runtime_error("Invalid UTF-8 lead byte");
-            assert(false);
-        }
-
         out.push_back(static_cast<wchar_t>(codepoint));
         ptr += seqlen;
     }
-
     return out;
 }
+
+class TuiSink final : public quill::Sink {
+public:
+    explicit TuiSink(uint16_t viewId) : _viewId(viewId) {}
+
+    void write_log(quill::MacroMetadata const*, uint64_t, std::string_view, std::string_view, std::string const&, std::string_view,
+                   quill::LogLevel log_level, std::string_view, std::string_view, std::vector<std::pair<std::string, std::string>> const*,
+                   std::string_view, std::string_view log_statement) override {
+        if (!g_tuiOn || g_tuiView == nullptr) {
+            return;
+        }
+        std::string_view line = log_statement;
+        if (!line.empty() && line.back() == '\n') {
+            line.remove_suffix(1);
+        }
+        g_tuiView->log(utf8ToWstring(line), static_cast<FLogView::LogLevel>(static_cast<uint8_t>(log_level)), _viewId);
+    }
+
+    void flush_sink() override {}
+
+private:
+    uint16_t _viewId;
+};
 #endif
 
 std::filesystem::path currentExecutablePath() {
@@ -137,105 +321,589 @@ std::filesystem::path currentExecutablePath() {
 #endif
 }
 
-void _folderSizer(std::filesystem::path folderPath){
-    static std::mutex folderSizerMutex;
-
-    // make function thread safe to avoid race condition for deleting same file
-    std::lock_guard<std::mutex> lock(folderSizerMutex);
-    
-    // calculate folder size
-    std::uintmax_t totalSize = 0;
-    std::vector<std::filesystem::path> logFiles;
+bool dirWritable(const std::filesystem::path& p) {
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(folderPath, ec)) {
-        // check for error
-        if (ec) continue;
+    return std::filesystem::is_directory(p, ec) && !ec && (::access(p.c_str(), W_OK | X_OK) == 0);
+}
 
-        std::error_code ec2;
-        if (entry.is_regular_file(ec2) && !ec2 && entry.path().extension() == ".log") {
-            totalSize += std::filesystem::file_size(entry);
-            logFiles.push_back(entry.path());
+bool ensureWritableDir(const std::filesystem::path& p) {
+    std::error_code ec;
+    std::filesystem::create_directories(p, ec);
+    return !ec && dirWritable(p);
+}
+
+std::string stampLocal() {
+    const auto now = std::chrono::system_clock::now();
+    const auto sec = std::chrono::system_clock::to_time_t(now);
+    const auto usec = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
+    std::tm tm{};
+    localtime_r(&sec, &tm);
+    return fmtquill::format("{:04}-{:02}-{:02}_{:02}{:02}{:02}.{:06}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+                            static_cast<int>(usec.count()));
+}
+
+std::string sanitize(std::string_view name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+        if (c == '/' || c == '\0') {
+            out.push_back('_');
+        } else {
+            out.push_back(c);
         }
     }
-    
-    // delete oldest log file if folder size is greater than limit
-    if(totalSize > MAX_TASK_LOG_FOLDER_SIZE) {
-        // Lexicographical compare on filenames
-        auto comp = [](const std::filesystem::path& a, const std::filesystem::path& b){
-            return a.filename().string() < b.filename().string();
-        };
-        auto oldestFile = std::min_element(logFiles.begin(), logFiles.end(), comp);
-        
-        // remove the oldest file
-        LOG(uOS::LogLevel::LOG_INFO, "Log size in folder: {} is {} bytes. Deleting oldest log file: {}", folderPath.filename().string(), totalSize, oldestFile->filename().string());
-        if(std::filesystem::remove(*oldestFile) == false) {
-            ASSERT_FOR_FATAL(false);
+    return out;
+}
+
+std::filesystem::path uniqueLogPath(const std::filesystem::path& folder, const std::string& stamp, const std::string& body) {
+    std::error_code ec;
+    auto path = folder / (stamp + body + ".log");
+    if (!std::filesystem::exists(path, ec)) {
+        return path;
+    }
+    for (int n = 1; n < 1000; ++n) {
+        path = folder / (stamp + body + "_" + std::to_string(n) + ".log");
+        if (!std::filesystem::exists(path, ec)) {
+            return path;
         }
-    } else {
-        LOG(uOS::LogLevel::LOG_TRACE, "Log size in folder: {} is {} bytes", folderPath.filename().string(), totalSize);
+    }
+    return path;
+}
+
+std::uintmax_t rotationBytes(const uOS::LogLimits& limits) { return std::max(limits.maxFileBytes, std::uintmax_t{512}); }
+
+uint32_t backupCount(const uOS::LogLimits& limits) {
+    const auto bytes = rotationBytes(limits);
+    std::uintmax_t byBytes = bytes == 0 ? 1 : limits.maxFolderBytes / bytes;
+    if (byBytes == 0) {
+        byBytes = 1;
+    }
+    const std::uintmax_t files = limits.maxFolderFiles == 0 ? 1 : limits.maxFolderFiles;
+    std::uintmax_t n = std::min(files, byBytes);
+    if (n < 1) {
+        n = 1;
+    }
+    if (n > std::numeric_limits<uint32_t>::max()) {
+        n = std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(n);
+}
+
+quill::RotatingFileSinkConfig rotatingConfig(const uOS::LogLimits& limits) {
+    quill::RotatingFileSinkConfig cfg;
+    const auto bytes = rotationBytes(limits);
+    const auto capped = std::min(bytes, std::uintmax_t{std::numeric_limits<std::size_t>::max()});
+    cfg.set_rotation_max_file_size(static_cast<std::size_t>(capped));
+    cfg.set_max_backup_files(backupCount(limits));
+    cfg.set_rotation_naming_scheme(quill::RotatingFileSinkConfig::RotationNamingScheme::Index);
+    cfg.set_open_mode("a");
+    cfg.set_fsync_enabled(true);
+    return cfg;
+}
+
+void appendToSystemFile(std::string_view text) {
+    if (g_systemPath.empty() || text.empty()) {
+        return;
+    }
+    const int fd = ::open(g_systemPath.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    writeAllFd(fd, text.data(), text.size());
+    ::fsync(fd);
+    ::close(fd);
+}
+
+void logStdio(const std::string& line) {
+    if (g_stdio == nullptr) {
+        return;
+    }
+    const auto level = static_cast<uOS::LogLevel>(g_systemFileLevel.load(std::memory_order_relaxed));
+    if (level == uOS::LogLevel::LOG_TRACE_L3) {
+        QUILL_LOG_TRACE_L3(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_TRACE_L2) {
+        QUILL_LOG_TRACE_L2(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_TRACE_L1) {
+        QUILL_LOG_TRACE_L1(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_DEBUG) {
+        QUILL_LOG_DEBUG(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_INFO) {
+        QUILL_LOG_INFO(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_NOTICE) {
+        QUILL_LOG_NOTICE(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_WARNING) {
+        QUILL_LOG_WARNING(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_ERROR) {
+        QUILL_LOG_ERROR(g_stdio, "{}", line);
+    } else if (level == uOS::LogLevel::LOG_CRITICAL) {
+        QUILL_LOG_CRITICAL(g_stdio, "{}", line);
     }
 }
 
+#ifdef uOS_ENABLE_TUI
+int writeSavedOut(const char* data, std::size_t size) {
+    if (g_savedOut < 0 || data == nullptr) {
+        return -1;
+    }
+    std::size_t left = size;
+    while (left > 0) {
+        const ssize_t n = ::write(g_savedOut, data, left);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        data += n;
+        left -= static_cast<std::size_t>(n);
+    }
+    return 0;
+}
 
-} // namespace anonymous
+void directTuiToTerminal() {
+    finalcut::FTermcap::setPutCharFunction([](int ch) -> int {
+        const char c = static_cast<char>(ch);
+        return writeSavedOut(&c, 1) < 0 ? -1 : ch;
+    });
+    finalcut::FTermcap::setPutStringFunction(
+        [](const char* s, std::uint32_t len) -> int { return writeSavedOut(s, len) < 0 ? -1 : static_cast<int>(len); });
+}
+#endif
 
+void consumePipe(int fd, std::string& pending, const char* tag) {
+    char buf[4096];
+    while (true) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (n == 0) {
+            return;
+        }
+        pending.append(buf, buf + n);
+        std::size_t start = 0;
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            if (pending[i] != '\n') {
+                continue;
+            }
+            logStdio(std::string(tag) + pending.substr(start, i - start));
+            start = i + 1;
+        }
+        pending.erase(0, start);
+    }
+}
 
+void teeMain() {
+    uOS::prepareLogThread();
+    std::string outPending;
+    std::string errPending;
+    bool outOpen = g_outPipe[0] >= 0;
+    bool errOpen = g_errPipe[0] >= 0;
+    while (outOpen || errOpen) {
+        pollfd fds[2]{};
+        nfds_t count = 0;
+        int outIndex = -1;
+        int errIndex = -1;
+        if (outOpen) {
+            outIndex = static_cast<int>(count);
+            fds[count].fd = g_outPipe[0];
+            fds[count].events = POLLIN;
+            ++count;
+        }
+        if (errOpen) {
+            errIndex = static_cast<int>(count);
+            fds[count].fd = g_errPipe[0];
+            fds[count].events = POLLIN;
+            ++count;
+        }
+        const int rc = ::poll(fds, count, 200);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        auto take = [&](int index, int fd, std::string& pending, const char* tag, bool& openFlag) {
+            if (index < 0) {
+                return;
+            }
+            if (fds[index].revents & (POLLIN | POLLHUP | POLLERR)) {
+                consumePipe(fd, pending, tag);
+                if (fds[index].revents & (POLLHUP | POLLERR)) {
+                    if (!pending.empty()) {
+                        logStdio(std::string(tag) + pending);
+                        pending.clear();
+                    }
+                    openFlag = false;
+                }
+            }
+        };
+        take(outIndex, g_outPipe[0], outPending, "STDOUT ", outOpen);
+        take(errIndex, g_errPipe[0], errPending, "STDERR ", errOpen);
+    }
+}
 
+void startTee() {
+    g_savedOut = ::dup(STDOUT_FILENO);
+    g_savedErr = ::dup(STDERR_FILENO);
+    ASSERT_FOR_FATAL(g_savedOut >= 0 && g_savedErr >= 0);
+#ifdef uOS_ENABLE_TUI
+    directTuiToTerminal();
+#endif
+    ASSERT_FOR_FATAL(::pipe(g_outPipe) == 0);
+    ASSERT_FOR_FATAL(::pipe(g_errPipe) == 0);
+    ::fcntl(g_outPipe[0], F_SETFL, O_NONBLOCK);
+    ::fcntl(g_errPipe[0], F_SETFL, O_NONBLOCK);
+    ASSERT_FOR_FATAL(::dup2(g_outPipe[1], STDOUT_FILENO) >= 0);
+    ASSERT_FOR_FATAL(::dup2(g_errPipe[1], STDERR_FILENO) >= 0);
+    g_teeOn = true;
+    g_tee = std::thread(teeMain);
+}
+
+void stopTee() {
+    if (!g_teeOn) {
+        return;
+    }
+    ::dup2(g_savedOut, STDOUT_FILENO);
+    ::dup2(g_savedErr, STDERR_FILENO);
+    if (g_outPipe[1] >= 0) {
+        ::close(g_outPipe[1]);
+        g_outPipe[1] = -1;
+    }
+    if (g_errPipe[1] >= 0) {
+        ::close(g_errPipe[1]);
+        g_errPipe[1] = -1;
+    }
+    if (g_tee.joinable()) {
+        g_tee.join();
+    }
+    if (g_outPipe[0] >= 0) {
+        ::close(g_outPipe[0]);
+        g_outPipe[0] = -1;
+    }
+    if (g_errPipe[0] >= 0) {
+        ::close(g_errPipe[0]);
+        g_errPipe[0] = -1;
+    }
+    g_teeOn = false;
+}
+
+void drainFd(int fd) {
+    if (fd < 0) {
+        return;
+    }
+    char buf[4096];
+    while (true) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (n == 0) {
+            return;
+        }
+        appendToSystemFile(std::string_view(buf, static_cast<std::size_t>(n)));
+    }
+}
+
+void onAlarm(int) {
+    const int sig = g_crashSig.load(std::memory_order_relaxed);
+    const int original = sig == 0 ? SIGABRT : sig;
+    std::signal(original, SIG_DFL);
+    raise(original);
+}
+
+void crashHandler(int sig) {
+    if (g_inCrash.test_and_set(std::memory_order_acq_rel)) {
+        return;
+    }
+    g_crashSig.store(sig, std::memory_order_relaxed);
+    ::alarm(20);
+
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (g_teeOn) {
+        drainFd(g_outPipe[0]);
+        drainFd(g_errPipe[0]);
+    }
+
+    if (g_backendUp.load(std::memory_order_acquire) && !quill::Logger::is_current_thread_backend_thread()) {
+        if (auto* logger = uOS::systemLog().native()) {
+            try {
+                logger->flush_log(0);
+            } catch (...) {
+            }
+        }
+        if (g_stdio != nullptr) {
+            try {
+                g_stdio->flush_log(0);
+            } catch (...) {
+            }
+        }
+    }
+
+    const char* name = "signal";
+    switch (sig) {
+        case SIGSEGV:
+            name = "Segmentation fault";
+            break;
+        case SIGABRT:
+            name = "Abort";
+            break;
+        case SIGILL:
+            name = "Illegal instruction";
+            break;
+        case SIGBUS:
+            name = "Bus error";
+            break;
+        default:
+            break;
+    }
+
+    backward::StackTrace st;
+    st.load_here(32);
+    backward::Printer printer;
+    printer.object = false;
+    printer.address = false;
+    printer.snippet = true;
+    printer.color_mode = backward::ColorMode::never;
+    std::ostringstream trace;
+    trace << "\n" << name << " (signal " << sig << "). backtrace:\n";
+    printer.print(st, trace);
+    const std::string text = trace.str();
+    appendToSystemFile(text);
+
+    printer.color_mode = backward::ColorMode::automatic;
+    if (g_savedErr >= 0) {
+        writeAllFd(g_savedErr, text.data(), text.size());
+    } else {
+        printer.print(st, stderr);
+    }
+
+    std::signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void installCrashSignals() {
+    struct sigaction alarmAction{};
+    alarmAction.sa_handler = onAlarm;
+    sigemptyset(&alarmAction.sa_mask);
+    sigaction(SIGALRM, &alarmAction, nullptr);
+
+    struct sigaction action{};
+    action.sa_handler = crashHandler;
+    sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGALRM);
+    for (int sig : {SIGSEGV, SIGABRT, SIGILL, SIGBUS}) {
+        sigaction(sig, &action, nullptr);
+    }
+}
+
+#ifdef uOS_ENABLE_TUI
+void tuiThreadFunc() {
+    uOS::prepareLogThread();
+    finalcut::FApplication::getApplicationObject()->exec();
+}
+#endif
+
+} // namespace
 
 namespace uOS {
 
+struct LogStream::Impl {
+    quill::Logger* logger = nullptr;
+    std::shared_ptr<quill::Sink> fileSink;
+    std::shared_ptr<quill::Sink> uiSink;
+    std::string typeName;
+    std::filesystem::path path;
+    std::filesystem::path folder;
+    LogLimits limits{};
+    std::atomic<uint8_t> fileLevel{static_cast<uint8_t>(LogLevel::LOG_INFO)};
+    std::atomic<uint8_t> uiLevel{static_cast<uint8_t>(LogLevel::LOG_INFO)};
+    bool system = false;
 
-void Logger::init(int argc, char* argv[], const std::string& appName, std::optional<std::function<void(void)>> quitCb)
-{
-    bool logsCreated = false;
-    bool systemCreated = false;
-    const std::string_view logsRootFolderName = "LOGS";
-    const std::string_view systemLogsFolderName = "_SYSTEM";
-    std::filesystem::path systemFolderPath;
-
-#ifdef uOS_ENABLE_TUI
-    // start TUI if a quit callback is provided
-    if(quitCb.has_value()) {
-        //static finalcut::FApplication app(argc, argv);
-        _tui = new finalcut::FApplication(argc, argv);
-
-        // Force terminal initialization without calling show()
-        _tui->initTerminal();
-
-        // create logger
-        //_loggerFw = new FLogView(_tui, 2000);
-        _loggerTasks = new FLogViewMulti(_tui, 1000);
-        finalcut::FWidget::setMainWidget(_loggerTasks);
-
-        // configure loger
-        _loggerTasks->setText(L"Logger");
-        _loggerTasks->unsetShadow();
-        _loggerTasks->setResizable(true);
-        _loggerTasks->setGeometry(finalcut::FPoint{1,1}, finalcut::FSize{_tui->getDesktopWidth(), _tui->getDesktopHeight()});
-        _loggerTasks->registerOnQuit(quitCb.value());
-        _loggerTasks->show();  // todo: bunu start'a taşıyabiliriz
-    }
-#else
-    (void)argc;
-    (void)argv;
-    (void)quitCb;
-#endif
-
-    // initialize file logger
-    auto dirWritable = [](const std::filesystem::path& p) {
-        std::error_code ec;
-        return std::filesystem::is_directory(p, ec) && !ec &&
-               (::access(p.c_str(), W_OK | X_OK) == 0);
-    };
-    auto ensureWritableDir = [&](const std::filesystem::path& p) {
-        std::error_code ec;
-        const bool existed = std::filesystem::is_directory(p, ec);
-        std::filesystem::create_directories(p, ec);
-        if (ec || !dirWritable(p)) {
-            return false;
+    ~Impl() {
+        if (quill::Logger::is_current_thread_backend_thread()) {
+            return;
         }
-        return !existed;
-    };
+        quill::Logger* dying = logger;
+        logger = nullptr;
+        if (dying && g_backendUp.load(std::memory_order_acquire)) {
+            try {
+                if (dying->is_valid_logger()) {
+                    quill::Frontend::remove_logger_blocking(dying, 0);
+                }
+            } catch (...) {
+            }
+        }
+        fileSink.reset();
+        uiSink.reset();
+        if (!path.empty()) {
+            noteDead(path);
+            sweepFolder(folder, limits);
+        }
+    }
+};
+
+} // namespace uOS
+
+namespace {
+
+void attachCapture(const std::shared_ptr<quill::Sink>& sink) {
+    if (g_captureOn && sink) {
+        sink->add_filter(std::make_unique<CaptureFilter>());
+    }
+}
+
+uOS::LogStream makeStream(const std::filesystem::path& folder, const std::filesystem::path& path, std::string loggerName, std::string typeName,
+                          uint16_t viewId, uOS::LogLimits limits, bool system, uOS::TaskId id) {
+    (void)viewId;
+    ASSERT_FOR_FATAL(ensureWritableDir(folder));
+    quill::FileEventNotifier notifier;
+    notifier.after_close = [folder, limits](const std::filesystem::path&) { sweepFolder(folder, limits); };
+
+    auto fileSink = quill::Frontend::create_or_get_sink<quill::RotatingFileSink>(path.string(), rotatingConfig(limits), std::move(notifier));
+    fileSink->set_log_level_filter(toQuill(uOS::LogLevel::LOG_INFO));
+    noteLive(path);
+    sweepFolder(folder, limits);
+
+    std::shared_ptr<quill::Sink> uiSink;
+    if (g_tuiOn) {
+#ifdef uOS_ENABLE_TUI
+        uiSink = quill::Frontend::create_or_get_sink<TuiSink>("tui:" + path.string(), viewId);
+#endif
+    } else {
+        uiSink = quill::Frontend::create_or_get_sink<quill::ConsoleSink>("console:" + path.string());
+    }
+    if (uiSink) {
+        uiSink->set_log_level_filter(toQuill(uOS::LogLevel::LOG_INFO));
+        attachCapture(uiSink);
+    }
+
+    std::vector<std::shared_ptr<quill::Sink>> sinks;
+    sinks.push_back(fileSink);
+    if (uiSink) {
+        sinks.push_back(uiSink);
+    }
+
+    quill::Logger* logger = nullptr;
+    try {
+        logger = quill::Frontend::create_logger(loggerName, std::move(sinks), logPattern(), quill::ClockSourceType::System);
+    } catch (const quill::QuillError&) {
+        loggerName += "#" + std::to_string(static_cast<unsigned>(id));
+        sinks.clear();
+        sinks.push_back(fileSink);
+        if (uiSink) {
+            sinks.push_back(uiSink);
+        }
+        logger = quill::Frontend::create_logger(loggerName, std::move(sinks), logPattern(), quill::ClockSourceType::System);
+    }
+    logger->set_log_level(toQuill(uOS::LogLevel::LOG_INFO));
+    if (system) {
+        g_systemFileSink = fileSink;
+    }
+
+    auto impl = std::make_shared<uOS::LogStream::Impl>();
+    impl->logger = logger;
+    impl->fileSink = std::move(fileSink);
+    impl->uiSink = std::move(uiSink);
+    impl->typeName = std::move(typeName);
+    impl->path = path;
+    impl->folder = folder;
+    impl->limits = limits;
+    impl->system = system;
+    return uOS::LogStream{std::move(impl)};
+}
+
+} // namespace
+
+namespace uOS {
+
+LogStream::LogStream() noexcept = default;
+LogStream::~LogStream() = default;
+LogStream::LogStream(const LogStream&) noexcept = default;
+LogStream& LogStream::operator=(const LogStream&) noexcept = default;
+LogStream::LogStream(LogStream&&) noexcept = default;
+LogStream& LogStream::operator=(LogStream&&) noexcept = default;
+
+LogStream::LogStream(std::shared_ptr<Impl> impl) noexcept : _impl(std::move(impl)) {}
+
+LogStream::operator bool() const noexcept { return native() != nullptr; }
+
+quill::Logger* LogStream::native() const noexcept { return _impl ? _impl->logger : nullptr; }
+
+std::string_view LogStream::typeName() const noexcept {
+    if (!_impl) {
+        return {};
+    }
+    return _impl->typeName;
+}
+
+void LogStream::setLevels(LogLevel fileLevel, LogLevel uiLevel) {
+    if (!_impl || !_impl->logger) {
+        return;
+    }
+    if (_impl->fileSink) {
+        _impl->fileSink->set_log_level_filter(toQuill(fileLevel));
+    }
+    if (_impl->uiSink) {
+        _impl->uiSink->set_log_level_filter(toQuill(uiLevel));
+    }
+    _impl->fileLevel.store(static_cast<uint8_t>(fileLevel), std::memory_order_relaxed);
+    _impl->uiLevel.store(static_cast<uint8_t>(uiLevel), std::memory_order_relaxed);
+    if (_impl->system) {
+        g_systemFileLevel.store(static_cast<uint8_t>(fileLevel), std::memory_order_relaxed);
+    }
+    if (_impl->logger->is_valid_logger()) {
+        _impl->logger->set_log_level(toQuill(quieter(fileLevel, uiLevel)));
+    }
+}
+
+LogLevel LogStream::fileLevel() const noexcept {
+    if (!_impl) {
+        return LogLevel::LOG_INFO;
+    }
+    return static_cast<LogLevel>(_impl->fileLevel.load(std::memory_order_relaxed));
+}
+
+LogLevel LogStream::uiLevel() const noexcept {
+    if (!_impl) {
+        return LogLevel::LOG_INFO;
+    }
+    return static_cast<LogLevel>(_impl->uiLevel.load(std::memory_order_relaxed));
+}
+
+void LogStream::flush() const {
+    if (!_impl || !_impl->logger || !g_backendUp.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (quill::Logger::is_current_thread_backend_thread()) {
+        return;
+    }
+    try {
+        if (_impl->logger->is_valid_logger()) {
+            _impl->logger->flush_log(0);
+        }
+    } catch (...) {
+    }
+}
+
+LogStream systemLog() {
+    std::lock_guard lock(g_taskMu);
+    return g_systemStream;
+}
+
+void prepareLogThread() { quill::Frontend::preallocate(); }
+
+void Logger::init(int argc, char* argv[], const std::string& appName, std::optional<std::function<void(void)>> quitCb) {
+    const std::string_view logsRootFolderName = "LOGS";
     const std::string stateAppName = appName.empty() ? std::string("uOS") : appName;
     auto xdgStateLogs = [&]() {
         if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg && xdg[0] != '\0') {
@@ -248,355 +916,210 @@ void Logger::init(int argc, char* argv[], const std::string& appName, std::optio
         return std::filesystem::temp_directory_path(ec) / stateAppName / logsRootFolderName;
     };
 
-    // Prefer <exe-dir>/LOGS when writable (dev builds). Packaged /usr/bin is not.
-    // Executable lookup is platform-specific and non-fatal: Linux uses
-    // /proc/self/exe, macOS uses _NSGetExecutablePath. Empty path falls through
-    // to the XDG/temp location.
     bool usedExeDir = false;
+    bool rootCreated = false;
     if (const auto exe = currentExecutablePath(); !exe.empty()) {
-        _logFolderPath = exe.parent_path() / logsRootFolderName;
-        if (dirWritable(_logFolderPath)) {
-            logsCreated = false;
+        g_logRoot = exe.parent_path() / logsRootFolderName;
+        if (dirWritable(g_logRoot)) {
             usedExeDir = true;
-        } else if (ensureWritableDir(_logFolderPath)) {
-            logsCreated = true;
+        } else if (!std::filesystem::exists(g_logRoot) && ensureWritableDir(g_logRoot)) {
+            rootCreated = true;
             usedExeDir = true;
-        } else if (dirWritable(_logFolderPath)) {
+        } else if (dirWritable(g_logRoot)) {
             usedExeDir = true;
         }
     }
     if (!usedExeDir) {
-        _logFolderPath = xdgStateLogs();
-        logsCreated = ensureWritableDir(_logFolderPath);
-        ASSERT_FOR_FATAL(dirWritable(_logFolderPath));
+        g_logRoot = xdgStateLogs();
+        rootCreated = ensureWritableDir(g_logRoot);
+        ASSERT_FOR_FATAL(dirWritable(g_logRoot));
     }
 
-    // create _SYSTEM folder if necessary
-    systemFolderPath = _logFolderPath / systemLogsFolderName;
-    if (dirWritable(systemFolderPath)) {
-        systemCreated = false;
-    } else {
-        systemCreated = ensureWritableDir(systemFolderPath);
-        ASSERT_FOR_FATAL(dirWritable(systemFolderPath));
-    }
-
-    // create system log file
-    std::time_t now = std::time(nullptr);
-    std::tm* timeStruct = std::localtime(&now); 
-    std::ostringstream fileNameStream;
-    fileNameStream  << std::setw(2) << std::setfill('0') << ((timeStruct->tm_year + 1900) % 100)
-                    << std::setw(2) << std::setfill('0') << (timeStruct->tm_mon + 1)
-                    << std::setw(2) << std::setfill('0') << timeStruct->tm_mday
-                    << std::setw(2) << std::setfill('0') << timeStruct->tm_hour
-                    << std::setw(2) << std::setfill('0') << timeStruct->tm_min
-                    << std::setw(2) << std::setfill('0') << timeStruct->tm_sec;
-    
-    std::ofstream systemFile(systemFolderPath / (fileNameStream.str() + ".log"));
-    ASSERT_FOR_FATAL(systemFile.is_open());
-
-    // add to system file
-    _systemFile = std::make_unique<TaskLogStream>(std::move(systemFile), std::move(systemFolderPath), fileNameStream.str());
-
-    // enable crash backtrace reporting
-    std::signal(SIGSEGV, _systemSignalHandler); // Segmentation fault
-    std::signal(SIGABRT, _systemSignalHandler); // Abort signal
-    std::signal(SIGILL, _systemSignalHandler);  // Illegal instruction
-    std::signal(SIGBUS, _systemSignalHandler);  // Bus error
-
-    // print info
 #ifdef uOS_ENABLE_TUI
-    if(quitCb.has_value()){
-        LOG(LogLevel::LOG_INFO, "Logger initialized with TUI");
-    } else {
-        LOG(LogLevel::LOG_INFO, "Logger initialized without TUI");
+    if (quitCb.has_value()) {
+        g_tui = new finalcut::FApplication(argc, argv);
+        g_tui->initTerminal();
+        g_tuiView = new FLogViewMulti(g_tui, 1000);
+        finalcut::FWidget::setMainWidget(g_tuiView);
+        g_tuiView->setText(L"Logger");
+        g_tuiView->unsetShadow();
+        g_tuiView->setResizable(true);
+        g_tuiView->setGeometry(finalcut::FPoint{1, 1}, finalcut::FSize{g_tui->getDesktopWidth(), g_tui->getDesktopHeight()});
+        g_tuiView->registerOnQuit(quitCb.value());
+        g_tuiView->show();
+        g_tuiView->createView(kSystemViewId, "system");
+        g_tuiOn = true;
     }
 #else
-    LOG(LogLevel::LOG_INFO, "Logger initialized without TUI");
+    (void)argc;
+    (void)argv;
+    (void)quitCb;
 #endif
-    if(logsCreated){
-        LOG(LogLevel::LOG_INFO, "Root log folder created");
+
+    if (const char* capture = std::getenv("UOS_LOG_CAPTURE"); capture && capture[0] == '1') {
+        g_captureOn = true;
     }
-    if(systemCreated){
-        LOG(LogLevel::LOG_INFO, "System logs folder created");
+
+    quill::Backend::start(quill::BackendOptions{});
+    g_backendUp.store(true, std::memory_order_release);
+    prepareLogThread();
+
+    const auto systemFolder = g_logRoot / "system";
+    const bool systemCreated = !dirWritable(systemFolder);
+    const auto systemPath = uniqueLogPath(systemFolder, stampLocal(), "");
+    g_systemPath = systemPath;
+    {
+        std::lock_guard lock(g_taskMu);
+        g_systemStream = makeStream(systemFolder, systemPath, "system", "system", kSystemViewId, {}, true, 0);
+    }
+
+    if (g_tuiOn && g_systemFileSink) {
+        g_stdio = quill::Frontend::create_logger("stdio", g_systemFileSink, logPattern(), quill::ClockSourceType::System);
+        g_stdio->set_log_level(quill::LogLevel::TraceL3);
+        startTee();
+    }
+
+    installCrashSignals();
+
+    SLOG(LogLevel::LOG_INFO, "{}", g_tuiOn ? "logger initialized with TUI" : "logger initialized without TUI");
+    if (rootCreated) {
+        SLOG(LogLevel::LOG_INFO, "root log folder created");
+    }
+    if (systemCreated) {
+        SLOG(LogLevel::LOG_INFO, "system log folder created");
     }
 }
 
 void Logger::start(void) {
 #ifdef uOS_ENABLE_TUI
-    if(_tui != nullptr){
-        _loggerThread = std::thread{tuiThreadFunc};
+    if (g_tui != nullptr) {
+        g_tuiThread = std::thread(tuiThreadFunc);
     }
 #endif
 }
 
 void Logger::stop(void) {
-    // close files
+    if (auto sys = systemLog()) {
+        sys.flush();
+    }
     {
-        std::lock_guard sysFileLock(_systemFile->fileMutex);
-        _systemFile->fileStream.close();
+        std::lock_guard lock(g_taskMu);
+        for (auto& [id, stream] : g_tasks) {
+            (void)id;
+            stream.flush();
+        }
     }
-
-    std::shared_lock taskFileMapLock(_taskFileMapMutex);
-    for (auto& [taskId, taskLogStream] : _taskFileMap) {
-        std::lock_guard<std::mutex> taskFileLock(taskLogStream.fileMutex);
-        taskLogStream.fileStream.close();
-    }
-    taskFileMapLock.unlock();
-    
-#ifdef uOS_ENABLE_TUI
-    // shut down TUI and its thread
-    if (_tui) {
-        _tui->quit();
-        _loggerThread.join();
-        delete _tui;
-        _tui = nullptr;
-    }
-
-    if (_loggerThread.joinable()) {
-        _loggerThread.join();
-    }
-#endif
-}
-
-void Logger::addTaskLogger(const TaskId taskId, const std::string& taskName, const std::string& instName) {
-    // create task folder if necessary
-    std::filesystem::path taskFolderPath = _logFolderPath / taskName;
-    if (std::filesystem::exists(taskFolderPath)) {
-        // check folder size if exists
-        _folderSizer(taskFolderPath);
-    } else {
-        if (std::filesystem::create_directory(taskFolderPath)) {
-            LOG(LogLevel::LOG_INFO, "Task log folder created: {}", taskFolderPath.filename().string());
-        } else {
-            ASSERT_FOR_FATAL(false);
+    if (g_stdio != nullptr && g_backendUp.load(std::memory_order_acquire) && !quill::Logger::is_current_thread_backend_thread()) {
+        try {
+            g_stdio->flush_log(0);
+        } catch (...) {
         }
     }
 
-    // form file name
-    // name part of the file name
-    std::string fileNameIdPart = instName + '_' + taskName + '_' + std::to_string(taskId);
-
-    // timestamp part of the file name
-    // get current time
-    auto now = std::chrono::system_clock::now();
-    // calendar conversion
-    auto tt = std::chrono::system_clock::to_time_t(now);
-    std::tm tm;
-    localtime_r(&tt, &tm);
-    // get subsecond part
-    auto since_epoch = now.time_since_epoch();
-    auto secs   = std::chrono::duration_cast<std::chrono::seconds>(since_epoch);
-    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(since_epoch - secs).count();
-    // format into YYMMDDHHMMSSµµµµµµ
-    std::ostringstream fileTimeStampPart;
-    fileTimeStampPart << std::setw(2) << std::setfill('0') << ((tm.tm_year + 1900) % 100)
-                  << std::setw(2) << std::setfill('0') << (tm.tm_mon + 1)
-                  << std::setw(2) << std::setfill('0') << tm.tm_mday
-                  << std::setw(2) << std::setfill('0') << tm.tm_hour
-                  << std::setw(2) << std::setfill('0') << tm.tm_min
-                  << std::setw(2) << std::setfill('0') << tm.tm_sec
-                  << std::setw(6) << std::setfill('0') << micros << '_';
-
-    // form the full file name
-    std::string fileName = fileTimeStampPart.str() + fileNameIdPart;
-
-    // Open file for writing
-    std::ofstream taskfile(taskFolderPath / (fileName + ".log"));
-    
-    // Check if file was opened successfully
-    if (!taskfile.is_open()) {
-        ASSERT_FOR_FATAL(false);
-    }
-
-    // add to task file map
-    {
-        std::lock_guard lock(_taskFileMapMutex);
-        auto [iter, result] = _taskFileMap.try_emplace(taskId, std::move(taskfile), std::move(taskFolderPath), std::move(fileName));
-        ASSERT_FOR_FATAL(result);
-    }
-    LOG(LogLevel::LOG_INFO, "Log file created for instance: {} of type: {}", instName, taskName);
-    
 #ifdef uOS_ENABLE_TUI
-    // add tui view if tui is active
-    if(_tui != nullptr){
-        _loggerTasks->createView(static_cast<uint_fast16_t>(taskId), taskName);
-    }
-#endif
-}
-
-void Logger::removeTaskLogger(const TaskId taskId) {
-    // close log file and remove from map
-    {
-        std::lock_guard lock(_taskFileMapMutex);
-        auto iter = _taskFileMap.find(taskId);
-        ASSERT_FOR_FATAL(iter != _taskFileMap.end());
-        iter->second.fileStream.close();
-        _taskFileMap.erase(iter);
-    }
-    
-#ifdef uOS_ENABLE_TUI
-    // remove from tui view if tui is active
-    if(_tui != nullptr){
-        _loggerTasks->removeView(static_cast<uint_fast16_t>(taskId));
-    }
-#endif
-}
-
-void Logger::logFw(const char* file, const char* function, const int line, const LogLevel level, const std::string& formattedLogStr) {
-    _logCommon(file, function, line, level, formattedLogStr);
-}
-
-void Logger::logTask(const char* file, const char* function, const int line, const LogLevel level, const std::string& formattedLogStr, TaskId taskId, std::string_view taskIdentifier) {
-    _logCommon(file, function, line, level, formattedLogStr, taskId, taskIdentifier);
-}
-
-bool Logger::isActive(void) {
-#ifdef uOS_ENABLE_TUI
-    return _tui != nullptr;
-#else
-    return false;
-#endif
-}
-
-//////////////////////////////////////////////////////
-//                                                  //
-//////////////////////////////////////////////////////
-
-inline void Logger::_logCommon(const char* file, const char* function, const int line, const LogLevel level, const std::string& logStr, std::optional<TaskId> taskId, std::string_view taskIdentifier) {
-    // Get current time with high precision
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_time_t = std::chrono::system_clock::to_time_t(now);
-
-    // Cache localtime_r result per second
-    // this is done to avoid the overhead of calling localtime_r for every log line
-    static std::atomic<std::time_t> last_sec{0};
-    static std::tm cached_tm;
-    std::tm timeStruct;
-    if (last_sec.load(std::memory_order_relaxed) != now_time_t) {
-        localtime_r(&now_time_t, &cached_tm);
-        last_sec.store(now_time_t, std::memory_order_relaxed);
-    }
-    timeStruct = cached_tm;
-
-    // Extract microseconds
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()) % 1000000;
-
-    // Extract base file name (safe)
-    const char* baseFileName = std::strrchr(file, '/');
-    baseFileName = baseFileName ? baseFileName + 1 : file;
-
-    // Fast formatting with fmt
-    std::string logLine = fmt::format("{:02}:{:02}:{:02}.{:06d} {}:{}:{} [|] {}",
-        timeStruct.tm_hour, timeStruct.tm_min, timeStruct.tm_sec, static_cast<int>(us.count()),
-        baseFileName, line, function, logStr);
-
-    // write to log file
-    if(level != LogLevel::LOG_TRACE){
-        if(taskId){
-            std::shared_lock taskFileMapLock(_taskFileMapMutex);
-            auto iter = _taskFileMap.find(taskId.value());
-            ASSERT_FOR_FATAL(iter != _taskFileMap.end());
-            std::lock_guard<std::mutex> fileLock(iter->second.fileMutex);
-            iter->second.fileStream << _logLevelToString(level) << logLine << '\n';
-            _fileSizer(iter->second);
-        } else {
-            std::lock_guard<std::mutex> fileLock(_systemFile->fileMutex);
-            _systemFile->fileStream << _logLevelToString(level) << logLine << '\n';
-            _fileSizer(*_systemFile);
+    if (g_tui) {
+        g_tui->quit();
+        if (g_tuiThread.joinable()) {
+            g_tuiThread.join();
         }
     }
-
-    // print to tui or cout
+#endif
+    stopTee();
 #ifdef uOS_ENABLE_TUI
-    if(_tui != nullptr) {
-        std::wstring wstr = _utf8ToWstring(logLine);
+    if (g_tui) {
+        finalcut::FTermcap::setDefaultPutCharFunction();
+        finalcut::FTermcap::setDefaultPutStringFunction();
+        delete g_tui;
+        g_tui = nullptr;
+        g_tuiView = nullptr;
+        g_tuiOn = false;
+    }
+#endif
+    g_backendUp.store(false, std::memory_order_release);
+    quill::Backend::stop();
+}
 
-        if(taskId){
-            _loggerTasks->log(std::move(wstr), static_cast<FLogView::LogLevel>(level), static_cast<uint16_t>(taskId.value()));
-        } else {
-            // todo: handle system log on TUI
-            // _loggerFw->log(std::move(wstr), static_cast<FLogView::LogLevel>(level));
-        }
+LogStream Logger::openTask(std::string_view actorName, std::string_view instName, TaskId id, LogLimits limits) {
+    const std::string type = sanitize(actorName);
+    const std::string inst = sanitize(instName);
+    const auto folder = g_logRoot / type;
+    const auto file = uniqueLogPath(folder, stampLocal(), "_" + inst);
+    const std::string loggerName = type + "/" + inst;
+    LogStream stream = makeStream(folder, file, loggerName, type, static_cast<uint16_t>(id), limits, false, id);
+
+    {
+        std::lock_guard lock(g_taskMu);
+        g_tasks.insert_or_assign(id, stream);
+    }
+
+#ifdef uOS_ENABLE_TUI
+    if (g_tuiOn && g_tuiView != nullptr) {
+        g_tuiView->createView(static_cast<uint16_t>(id), loggerName);
+    }
+#endif
+    return stream;
+}
+
+void Logger::detachTask(TaskId id) {
+    {
+        std::lock_guard lock(g_taskMu);
+        g_tasks.erase(id);
+    }
+#ifdef uOS_ENABLE_TUI
+    if (g_tuiOn && g_tuiView != nullptr) {
+        g_tuiView->removeView(static_cast<uint16_t>(id));
+    }
+#endif
+}
+
+void Logger::setSystemLogLevels(LogLevel fileLevel, LogLevel uiLevel) {
+    if (auto sys = systemLog()) {
+        sys.setLevels(fileLevel, uiLevel);
+    }
+}
+
+void Logger::setTaskLogLevels(TaskId id, LogLevel fileLevel, LogLevel uiLevel) {
+    std::lock_guard lock(g_taskMu);
+    auto it = g_tasks.find(id);
+    if (it == g_tasks.end()) {
         return;
     }
-#endif
-    // print to cout if TUI is not active and level is above TRACE
-    if(level != LogLevel::LOG_TRACE) {
-        constexpr std::string_view colorReset = "\033[0m";
-
-        // Identifier: task name/instance if available, otherwise "SYSTEM"
-        std::string_view identifier = taskId ? taskIdentifier : "SYSTEM";
-        if (level != LogLevel::LOG_INFO) {
-            // Colored output for WARNING/ERROR
-            fmt::print("{}{}{} {} [|] {}\n",
-                _logLevelToColor(level),      // e.g. "\033[38;5;208m" or "\033[31m"
-                _logLevelToString(level),     // e.g. "WARNING "
-                colorReset,
-                identifier,
-                logStr);
-        } else {
-            // No color for INFO
-            fmt::print("{} {} [|] {}\n",
-                _logLevelToString(level),
-                identifier,
-                logStr);
-        }
-    }
+    it->second.setLevels(fileLevel, uiLevel);
 }
 
-inline void Logger::_fileSizer(TaskLogStream& logStream) {
-    if(++logStream.fileLineCount > MAX_FILE_LOG_LINE_COUNT) {
-        // close current file and open new one. check folder size
-        logStream.fileStream << "Max line count exceeded, creating new file";
-        logStream.fileStream.close();
-        logStream.overflowCount++;
-        logStream.fileLineCount = 0;
-        _folderSizer(logStream.folderPath);
-        logStream.fileStream.open(logStream.folderPath / (logStream.fileName + '_' + std::to_string(logStream.overflowCount) + ".log"));
-        if (logStream.fileStream.is_open() == false) {
-            ASSERT_FOR_FATAL(false);
-        }
-    }
+LogLevel Logger::systemFileLogLevel() {
+    auto sys = systemLog();
+    return sys ? sys.fileLevel() : LogLevel::LOG_INFO;
 }
 
-void Logger::_systemSignalHandler(int signum) {
-    // Capture backtrace up to 32 frames
-    backward::StackTrace st; 
-    st.load_here(32);
-    
-    // Configure printer
-    backward::Printer p;
-    p.object = false;
-    p.address = false;
-    p.snippet = true;   // show code snippets
-    p.color_mode = backward::ColorMode::automatic;  // color in terminal
-
-    // Handle system signals (e.g., segmentation fault)
-    switch (signum) {
-        case SIGSEGV: _systemFile->fileStream << "\nSegmentation fault occurred."; break;
-        case SIGABRT: _systemFile->fileStream << "\nAbort signal received."; break;
-        case SIGILL:  _systemFile->fileStream << "\nIllegal instruction encountered."; break;
-        case SIGBUS:  _systemFile->fileStream << "\nBus error occurred."; break;
-        default:      _systemFile->fileStream << "\nUnhandled signal (" << signum << ") received."; break;
-    }
-    _systemFile->fileStream << " Printing backtrace...\n";
-
-    // Add more signal handling as needed
-
-    // Print to system log file
-    p.print(st, _systemFile->fileStream);
-
-    // stop logger
-    stop();
-
-    // print to terminal
-    // p.color_mode  = backward::ColorMode::never;      // no color in file
-    p.print(st, stderr);
-
-    // Reset the signal handler to default and re-raise the signal
-    std::signal(signum, SIG_DFL);
-    raise(signum);
+LogLevel Logger::systemUiLogLevel() {
+    auto sys = systemLog();
+    return sys ? sys.uiLevel() : LogLevel::LOG_INFO;
 }
 
+LogLevel Logger::taskFileLogLevel(TaskId id) {
+    std::lock_guard lock(g_taskMu);
+    auto it = g_tasks.find(id);
+    if (it == g_tasks.end()) {
+        return LogLevel::LOG_INFO;
+    }
+    return it->second.fileLevel();
+}
 
-}   // namespace uOS
+LogLevel Logger::taskUiLogLevel(TaskId id) {
+    std::lock_guard lock(g_taskMu);
+    auto it = g_tasks.find(id);
+    if (it == g_tasks.end()) {
+        return LogLevel::LOG_INFO;
+    }
+    return it->second.uiLevel();
+}
+
+std::filesystem::path Logger::logRoot() { return g_logRoot; }
+
+std::vector<std::string> Logger::capturedUi() {
+    std::lock_guard lock(g_captureMu);
+    return g_capture;
+}
+
+} // namespace uOS

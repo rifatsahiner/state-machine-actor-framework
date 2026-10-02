@@ -8,8 +8,7 @@ Name: uOS
 Description: Hierarchical state-machine framework C++ library.
 Version: @PROJECT_VERSION@
 URL: https://github.com/rifatsahiner/state-machine-framework
-Requires: fmt >= 11.1
 Requires.private: @UOS_PC_REQUIRES_PRIVATE@
 Libs: -L${libdir} -luOS -pthread
 Libs.private: @UOS_PC_LIBS_PRIVATE@
-Cflags: -I${includedir}/uOS @UOS_PC_EXTRA_CFLAGS@
+Cflags: -I${includedir}/uOS -I${includedir} @UOS_PC_EXTRA_CFLAGS@

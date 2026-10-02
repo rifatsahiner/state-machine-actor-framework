@@ -77,6 +77,7 @@ void AsyncTask::resume(bool cleanStart) {
 
 void AsyncTask::_taskLoop(void)
 {
+    prepareLogThread();
     std::unique_lock<std::mutex> threadLock(_threadMutex);
 
     LOG(LogLevel::LOG_INFO, "Task thread loop entry");

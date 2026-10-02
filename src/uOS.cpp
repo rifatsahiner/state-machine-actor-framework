@@ -127,7 +127,7 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
         _cli = std::make_unique<cli::Cli>(std::move(rootMenu));
         _cli->WrongCommandHandler([](std::ostream& out, const std::string& cmd) {
             (void)out;
-            LOG(uOS::LogLevel::LOG_WARNING, "Unknown CLI command or incorrect parameters: {}", cmd);
+            SLOG(uOS::LogLevel::LOG_WARNING, "Unknown CLI command or incorrect parameters: {}", cmd);
         });
 
         // create scheduler and telnet server
@@ -136,14 +136,14 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
         try {
             _cliServer = std::make_unique<cli::StandaloneAsioCliTelnetServer>(*_cli, *_cliScheduler, cliPort);
             _cliServer->ExitAction([](auto& out) { out << "Closing CLI connection...\n"; });
-            LOG(uOS::LogLevel::LOG_INFO, "CLI started on port: {}", cliPort);
+            SLOG(uOS::LogLevel::LOG_INFO, "CLI started on port: {}", cliPort);
         } catch (const std::system_error& e) {
             // Handle binding failure (e.g., port in use)
-            LOG(uOS::LogLevel::LOG_ERROR, "Failed to start CLI server on port {}: {}", cliPort, e.what());
+            SLOG(uOS::LogLevel::LOG_ERROR, "Failed to start CLI server on port {}: {}", cliPort, e.what());
             _cliServer.reset(); // Ensure it's null if failed
         } catch (const std::exception& e) {
             // Catch any other unexpected exceptions
-            LOG(uOS::LogLevel::LOG_ERROR, "Unexpected error starting CLI server: {}", e.what());
+            SLOG(uOS::LogLevel::LOG_ERROR, "Unexpected error starting CLI server: {}", e.what());
             _cliServer.reset();
         }
     } else {
@@ -191,6 +191,7 @@ int32_t FW::run() {
     std::condition_variable cvDone;
 
     auto syncTaskProcessWorker = [&](int threadId) {
+        prepareLogThread();
         uint64_t lastProcessedCycle = 0; // Local to each thread
 
         while (poolRunning) {
@@ -234,8 +235,8 @@ int32_t FW::run() {
 
     // start logger
     Logger::start();
-    LOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
-    LOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
+    SLOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
+    SLOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
 
     // reserve sync task copy buffer and get the start time
     syncTaskListCopy.reserve(uOS_FW_MAX_TASK_COUNT);
@@ -315,7 +316,7 @@ int32_t FW::run() {
         }
         if (loopDuration > 18) {
             loopOverrunCount++;
-            LOG(uOS::LogLevel::LOG_WARNING, "Loop overruned {} th time with {} ms. Max loop duration: {} ms.", loopOverrunCount, loopDuration,
+            SLOG(uOS::LogLevel::LOG_WARNING, "Loop overruned {} th time with {} ms. Max loop duration: {} ms.", loopOverrunCount, loopDuration,
                 maxLoopDuration);
         }
 
@@ -333,7 +334,7 @@ int32_t FW::run() {
 #endif
 
     // terminate all task loops
-    LOG(uOS::LogLevel::LOG_INFO, "FW run loop exit. Stopping all tasks");
+    SLOG(uOS::LogLevel::LOG_INFO, "FW run loop exit. Stopping all tasks");
     {
         std::shared_lock readlock(_taskMutex);
         for (const auto& taskPair : _taskMap) {
@@ -353,7 +354,7 @@ int32_t FW::run() {
     dyingTasks.clear(); // NsaUeTask::~NsaUeTask may postEvent; that is now a no-op
 
     // terminate logger
-    LOG(LogLevel::LOG_INFO, "uOS Bye bye!");
+    SLOG(LogLevel::LOG_INFO, "uOS Bye bye!");
     Logger::stop();
 
     // onCleanup aşağıdaki satırlar
@@ -366,9 +367,21 @@ int32_t FW::run() {
 }
 
 void FW::kill(void) {
-    LOG(LogLevel::LOG_INFO, "Stopping FW");
+    SLOG(LogLevel::LOG_INFO, "Stopping FW");
     _isRunning = false;
 }
+
+void FW::setSystemLogLevels(LogLevel fileLevel, LogLevel uiLevel) { Logger::setSystemLogLevels(fileLevel, uiLevel); }
+
+void FW::setTaskLogLevels(TaskId id, LogLevel fileLevel, LogLevel uiLevel) { Logger::setTaskLogLevels(id, fileLevel, uiLevel); }
+
+LogLevel FW::systemFileLogLevel() { return Logger::systemFileLogLevel(); }
+
+LogLevel FW::systemUiLogLevel() { return Logger::systemUiLogLevel(); }
+
+LogLevel FW::taskFileLogLevel(TaskId id) { return Logger::taskFileLogLevel(id); }
+
+LogLevel FW::taskUiLogLevel(TaskId id) { return Logger::taskUiLogLevel(id); }
 
 std::shared_ptr<Task> FW::_requireTask(TaskId taskId) {
     std::shared_lock lock(_taskMutex);
@@ -389,14 +402,14 @@ std::shared_ptr<Task> FW::_findTask(TaskId taskId) {
 void FW::startTask(TaskId taskId) {
     auto task = _requireTask(taskId);
 
-    LOG(LogLevel::LOG_INFO, "Starting task with id: {}", taskId);
+    SLOG(LogLevel::LOG_INFO, "Starting task with id: {}", taskId);
     task->start();
 }
 
 void FW::stopTask(TaskId taskId, bool waitShutdown) {
     auto task = _requireTask(taskId);
 
-    LOG(LogLevel::LOG_INFO, "Stoping task with id: {}", taskId);
+    SLOG(LogLevel::LOG_INFO, "Stoping task with id: {}", taskId);
     task->stop(waitShutdown);
 }
 
@@ -418,12 +431,12 @@ bool FW::isTaskIdle(TaskId taskId) {
 void FW::resumeTask(TaskId taskId, bool cleanStart) {
     auto task = _requireTask(taskId);
 
-    LOG(LogLevel::LOG_INFO, "Resuming task with id: {}", taskId);
+    SLOG(LogLevel::LOG_INFO, "Resuming task with id: {}", taskId);
     task->resume(cleanStart);
 }
 
 void FW::deleteTask(TaskId taskId) {
-    LOG(LogLevel::LOG_INFO, "Deleting task with id: {}", taskId);
+    SLOG(LogLevel::LOG_INFO, "Deleting task with id: {}", taskId);
 
     // stop task
     stopTask(taskId, true);
@@ -460,7 +473,7 @@ void FW::deleteTask(TaskId taskId) {
                     if (it != _menuHandlerMap.end()) {
                         it->second.Remove();
                         _menuHandlerMap.erase(it);
-                        LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is removed", taskName);
+                        SLOG(LogLevel::LOG_INFO, "CLI menu for task: {} is removed", taskName);
                     }
                 });
             }
@@ -488,7 +501,7 @@ void FW::postEvent(TaskId taskId, std::shared_ptr<const Event> event) {
     // which happens on shutdown on tasks that post on their destructors
     auto task = _findTask(taskId);
     if (task == nullptr) {
-        LOG(LogLevel::LOG_ERROR, "postEvent: task with id: {} not found for signalId: {}", taskId, event->signal);
+        SLOG(LogLevel::LOG_ERROR, "postEvent: task with id: {} not found for signalId: {}", taskId, event->signal);
         return;
     }
     task->putEvent(std::move(event));
@@ -557,7 +570,7 @@ void FW::cancelTimedEvent(TimerId timerId) {
 
         ASSERT_FOR_FATAL(false);
     } else {
-        LOG(LogLevel::LOG_WARNING, "Timer Id: {} not found or already expired for cancel operation", timerId);
+        SLOG(LogLevel::LOG_WARNING, "Timer Id: {} not found or already expired for cancel operation", timerId);
     }
 }
 
@@ -583,7 +596,7 @@ void FW::subscribe(SignalId signalId, TaskId subsId) {
         subsList.push_back(subsId);
     }
 
-    LOG(LogLevel::LOG_INFO, "Task Id: {} subscribed to signalId: {}", subsId, signalId);
+    SLOG(LogLevel::LOG_INFO, "Task Id: {} subscribed to signalId: {}", subsId, signalId);
 }
 
 void FW::subscribe(std::initializer_list<SignalId> signalList, TaskId subsId) {
@@ -608,7 +621,7 @@ void FW::unsubscribe(SignalId signalId, TaskId subsId) {
     // remove subsId from list
     subsList.erase(subsIdIter);
 
-    LOG(LogLevel::LOG_INFO, "Task Id: {} unsubscribed to signalId: {}", subsId, signalId);
+    SLOG(LogLevel::LOG_INFO, "Task Id: {} unsubscribed to signalId: {}", subsId, signalId);
 
     // todo: sinyalde subs kalmadıysa map'den sil
 }
@@ -624,7 +637,7 @@ void FW::unsubscribe(std::initializer_list<SignalId> signalList, TaskId subsId) 
 //     // add to stop list
 //     std::lock_guard<std::mutex> lock(_listMutex);
 //     _stopList.push_back(taskId);
-//     LOG(LogLevel::LOG_INFO, "Self stop is schduled for task id: {}", taskId);
+//     SLOG(LogLevel::LOG_INFO, "Self stop is schduled for task id: {}", taskId);
 // }
 
 void FW::deleteAsyncTask(TaskId taskId) {
@@ -634,7 +647,7 @@ void FW::deleteAsyncTask(TaskId taskId) {
     // add to delete list
     std::lock_guard<std::mutex> lock(_listMutex);
     _deleteList.push_back(taskId);
-    LOG(LogLevel::LOG_INFO, "Self delete is schduled for task id: {}", taskId);
+    SLOG(LogLevel::LOG_INFO, "Self delete is schduled for task id: {}", taskId);
 }
 
 #ifdef uOS_ENABLE_CLI
@@ -653,13 +666,13 @@ void FW::registerCliMenu(TaskId taskId, std::unique_ptr<cli::Menu>&& menuPtr) {
             if (_menuHandlerMap.find(taskName) == _menuHandlerMap.end()) {
                 // insert menu and save menu handler
                 _menuHandlerMap[taskName] = _cliRootMenu->Insert(std::move(*copyableMenuPtrPtr));
-                LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is registered", taskName);
+                SLOG(LogLevel::LOG_INFO, "CLI menu for task: {} is registered", taskName);
             } else {
-                LOG(LogLevel::LOG_INFO, "CLI menu for task: {} is already registered", taskName);
+                SLOG(LogLevel::LOG_INFO, "CLI menu for task: {} is already registered", taskName);
             }
         });
     } else {
-        LOG(LogLevel::LOG_WARNING, "CLI scheduler is not initialized. Cannot register CLI menu for task id: {}", taskId);
+        SLOG(LogLevel::LOG_WARNING, "CLI scheduler is not initialized. Cannot register CLI menu for task id: {}", taskId);
     }
 }
 #endif
@@ -694,7 +707,7 @@ void FW::_publishEventCommon(std::shared_ptr<const Event>&& event, std::vector<T
             }
         } else {
             // if task is not found, log a warning
-            LOG(LogLevel::LOG_WARNING, "Task with id: {} not found on publishing signalId: {}", taskId, event->signal);
+            SLOG(LogLevel::LOG_WARNING, "Task with id: {} not found on publishing signalId: {}", taskId, event->signal);
         }
     }
 }
@@ -782,7 +795,7 @@ TimerId FW::_setupTimedEvent(bool isPublish, bool isPeriodic, uint_fast16_t inte
     // todo: assert if emplace fails
 
     // std::cout << "timer created with timer id: " << timerId << std::endl;
-    LOG(LogLevel::LOG_TRACE, "Timer created with timerId: {}", timerId);
+    SLOG(LogLevel::LOG_TRACE, "Timer created with timerId: {}", timerId);
     return timerId;
 }
 
@@ -817,7 +830,7 @@ void FW::_handleTick(void) // todo: inline yap
         // handle expired timers
         for (TimerId timerId : expiredTimers) {
             // std::cout << "expired timer with timer id: " << unsigned(timerId) << std::endl;
-            LOG(LogLevel::LOG_TRACE, "Timer expired with timerId: {}", timerId);
+            SLOG(LogLevel::LOG_TRACE, "Timer expired with timerId: {}", timerId);
 
             // get stored timer node with the timer key
             // todo: find thread safe değil burası kontrol edilecek
@@ -843,7 +856,7 @@ void FW::_handleTick(void) // todo: inline yap
                         it->second->putEvent(std::move(eventCopy));
                     }
                 } else {
-                    LOG(LogLevel::LOG_WARNING, "Timer expired for deleted task with id: {} ", timerNode.receiverTaskId);
+                    SLOG(LogLevel::LOG_WARNING, "Timer expired for deleted task with id: {} ", timerNode.receiverTaskId);
                 }
             }
 
@@ -885,19 +898,19 @@ void FW::_sigintHandler(int signum) {
     // log the signal type
     switch (signum) {
         case SIGINT:
-            LOG(LogLevel::LOG_WARNING, "SIGINT received, stopping FW");
+            SLOG(LogLevel::LOG_WARNING, "SIGINT received, stopping FW");
             break;
         case SIGTERM:
-            LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
+            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
             break;
         case SIGHUP:
-            LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
+            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
             break;
         case SIGQUIT:
-            LOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
+            SLOG(LogLevel::LOG_ERROR, "SIGINT received, stopping FW");
             break;
         default:
-            LOG(LogLevel::LOG_ERROR, "Unknown signal received: {}", signum);
+            SLOG(LogLevel::LOG_ERROR, "Unknown signal received: {}", signum);
             break;
     }
 

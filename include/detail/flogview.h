@@ -12,11 +12,18 @@ class FLogViewBase : public finalcut::FDialog
 
     void registerOnQuit(std::function<void(void)>);
 
-    enum class LogLevel : uint_fast8_t {
-      LOG_TRACE = 0,
+    enum class LogLevel : uint8_t {
+      LOG_TRACE_L3 = 0,
+      LOG_TRACE_L2,
+      LOG_TRACE_L1,
+      LOG_TRACE = LOG_TRACE_L1,
+      LOG_DEBUG,
       LOG_INFO,
+      LOG_NOTICE,
       LOG_WARNING,
-      LOG_ERROR
+      LOG_ERROR,
+      LOG_CRITICAL,
+      LOG_NONE = 10
     };
 
   private:
@@ -36,7 +43,6 @@ class FLogViewBase : public finalcut::FDialog
     finalcut::FTextView _textView{this};
     finalcut::FButton _buttonPlay{L"▶/▮▮", this};
     finalcut::FLabel _labelPlay{L"🟢", this};
-    finalcut::FButtonGroup _radiobutton_group {L"Log Level", this};
     finalcut::FButtonGroup _toggleGroup {L"Auto Scroll", this};
     finalcut::FSwitch _toggleAutoScroll{&_toggleGroup};
 
@@ -59,7 +65,6 @@ class FLogViewBase : public finalcut::FDialog
     // functions should be overriden by single and multi views (for single LogList or multiple)
     virtual void clear(void);
 
-    virtual void _logLevelClickCb(LogLevel);
     virtual void _filterChangedCb(void) = 0;
 
     // protected functions for single and multi
@@ -68,15 +73,10 @@ class FLogViewBase : public finalcut::FDialog
     void _printWithSearch(const LogItem&);
 
     std::mutex _loggerViewMtx;
-    LogLevel _currentLogLevel{LogLevel::LOG_INFO};
     bool _isPlaying{true};
     const uint_fast16_t _logSize;
 
     finalcut::FLineEdit _lineEditFilter {this};
-    finalcut::FRadioButton _error {"E", &_radiobutton_group};
-    finalcut::FRadioButton _warning {"W", &_radiobutton_group};
-    finalcut::FRadioButton _info {"I", &_radiobutton_group};
-    finalcut::FRadioButton _trace {"T", &_radiobutton_group};
     finalcut::FButton _buttonClear{L"Clear", this};
 
     static constexpr uint_fast16_t DEFAULT_LOG_BUFFER_SIZE = 2000;
@@ -90,7 +90,6 @@ class FLogView : public FLogViewBase {
     void clear(void) override;
 
   private:
-    void _logLevelClickCb(LogLevel) override;
     void _filterChangedCb(void) override;
 
     LogList _mainLogList;
@@ -112,7 +111,6 @@ class FLogViewMulti : public FLogViewBase {
 
     void _adjust(void);
 
-    void _logLevelClickCb(LogLevel) override;
     void _filterChangedCb(void) override;
     void _dropdownChangedCb(void);
 
