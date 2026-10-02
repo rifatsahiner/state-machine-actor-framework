@@ -88,8 +88,10 @@ private:
     static inline std::vector<TaskId> _deleteList;
     static inline std::mutex _listMutex;
 
-    // timer related
-    static inline std::array<bool, uOS_FW_MAX_TIMER_COUNT> _timerIdUsageList{};
+    // timer related. Ids 1 .. MAX-1; IDLE_TIMER_ID is never stored.
+    static inline std::array<TimerId, uOS_FW_MAX_TIMER_COUNT> _freeTimerIds{};
+    static inline uint_fast16_t _freeTimerHead = 0;
+    static inline uint_fast16_t _freeTimerCount = 0;
     static inline std::unordered_map<TimerId, TimerNode> _timerStorageMap;
     static inline std::forward_list<std::pair<TimerId, uint_fast16_t>> _timerQueue;
     static inline std::mutex _timerMutex;
@@ -112,6 +114,7 @@ private:
     static std::shared_ptr<Task> _findTask(TaskId taskId);
     static TaskId _getAvailableTaskId(void);
     static TimerId _getAvailableTimerId(void);
+    static void _releaseTimerId(TimerId);
     static void _insertTimerQueue(TimerId, uint_fast16_t);
     static TimerId _setupTimedEvent(bool, bool, uint_fast16_t, std::shared_ptr<const Event>&&, TaskId receiverTaskId = 0);
     static void _handleTick(void);
@@ -153,6 +156,7 @@ private:
     friend class AsyncTask;
 
 public:
+    // task logger is not ready until _topInitialTrans. create logging members there and not on task constructor
     template <class T, class... TaskArgs> static TaskId createTask(std::string taskName = "no-name-inst", TaskArgs&&... taskArgs) {
         decltype(_taskMap)::iterator iter;
 

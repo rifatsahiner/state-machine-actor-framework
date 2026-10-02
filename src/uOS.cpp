@@ -69,7 +69,11 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
 
     // init usage lists
     _taskIdUsageList.fill(false);
-    _timerIdUsageList.fill(false);
+    _freeTimerHead = 0;
+    _freeTimerCount = uOS_FW_MAX_TIMER_COUNT - 1;
+    for (uint_fast16_t i = 0; i < _freeTimerCount; ++i) {
+        _freeTimerIds[i] = static_cast<TimerId>(i + 1);
+    }
     _taskMap.clear();
     _syncTaskList.clear();
     _syncTaskList.reserve(uOS_FW_MAX_TASK_COUNT);
@@ -577,6 +581,10 @@ TimerId FW::publishEventEvery(uint_fast16_t intervalMs, std::shared_ptr<const Ev
 }
 
 void FW::cancelTimedEvent(TimerId timerId) {
+    if (timerId == IDLE_TIMER_ID) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(_timerMutex);
 
     // check if timer id is still present
@@ -594,7 +602,7 @@ void FW::cancelTimedEvent(TimerId timerId) {
                 // clear timer data
                 _timerQueue.erase_after(itPrev);
                 _timerStorageMap.erase(timerId);
-                _timerIdUsageList[timerId] = false;
+                _releaseTimerId(timerId);
 
                 return;
             } else
@@ -759,28 +767,22 @@ TaskId FW::_getAvailableTaskId(void) {
 }
 
 TimerId FW::_getAvailableTimerId(void) {
-    static TimerId lastTimerId = 0;
-    TimerId i;
+    ASSERT_FOR_FATAL(_freeTimerCount > 0);
 
-    // search for lastTimerId + 1 -> uOS_FW_MAX_TIMER_COUNT
-    for (i = lastTimerId + 1; i < uOS_FW_MAX_TIMER_COUNT; i++) {
-        if (_timerIdUsageList[i] == false) {
-            _timerIdUsageList[i] = true;
-            lastTimerId = i;
-            return i;
-        }
-    }
+    TimerId id = _freeTimerIds[_freeTimerHead];
+    _freeTimerHead = static_cast<uint_fast16_t>((_freeTimerHead + 1) % uOS_FW_MAX_TIMER_COUNT);
+    --_freeTimerCount;
+    return id;
+}
 
-    // if not found search for 0 -> lastTimerId
-    for (i = 0; i < lastTimerId; i++) {
-        if (_timerIdUsageList[i] == false) {
-            _timerIdUsageList[i] = true;
-            lastTimerId = i;
-            return i;
-        }
-    }
+void FW::_releaseTimerId(TimerId timerId) {
+    ASSERT_FOR_FATAL(timerId != IDLE_TIMER_ID);
+    ASSERT_FOR_FATAL(timerId < uOS_FW_MAX_TIMER_COUNT);
+    ASSERT_FOR_FATAL(_freeTimerCount < uOS_FW_MAX_TIMER_COUNT - 1);
 
-    ASSERT_FOR_FATAL(false);
+    uint_fast16_t tail = static_cast<uint_fast16_t>((_freeTimerHead + _freeTimerCount) % uOS_FW_MAX_TIMER_COUNT);
+    _freeTimerIds[tail] = timerId;
+    ++_freeTimerCount;
 }
 
 void FW::_insertTimerQueue(TimerId timerId, uint_fast16_t interval) {
@@ -901,7 +903,7 @@ void FW::_handleTick(void) // todo: inline yap
                                   (timerNode.interval - 1)); // -tam nedenini çözemedim ama 20ms fazla çıkıyor periyodiklerde, o yüzden -1 yaptım
             } else {
                 _timerStorageMap.erase(timerId);
-                _timerIdUsageList[timerId] = false;
+                _releaseTimerId(timerId);
             }
             lock.unlock();
         }

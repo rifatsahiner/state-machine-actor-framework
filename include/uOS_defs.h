@@ -20,6 +20,9 @@ using TimerId = uint_fast32_t;
 using TimerId = uint_fast16_t;
 #endif
 
+// Not a live timer. Allocation never returns this value.
+constexpr TimerId IDLE_TIMER_ID = 0;
+
 // taskId
 #if uOS_FW_MAX_TASK_COUNT > 256
 using TaskId = uint_fast16_t;

@@ -358,10 +358,10 @@ endif()
 
 
 
-# Task -> Actor
-# on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
-# timer id hiçbir zaman 0 vermeyecek şekilde değiştirilecek
 # Tasklara create-child-SM benzeri bir function template tanımlanabilir mi düşünülecek -> log stream kullananlar task constructor'ından çağırılmaması gerekiyor
+# Task -> Actor
+# evaluate timer functionality with grok
+# on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
 # CLI ve _getStateNameMap tekrar değerlendirilecek. _getStateNameMap kullanılmıyorsa kaldırılacak
 # task queue icin moodycamel::ConcurrentQueue dene
 # AI uygulama usr/bin klasörüne yüklendiğinde orada LOG klasörü yaratamayacağı için XDG_STATE_HOME diye bir yere koydu logları. Burayı düzelt
