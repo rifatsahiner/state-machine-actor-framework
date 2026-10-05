@@ -65,9 +65,8 @@ protected:
     Task& operator=(Task&&) = delete;
 
     // termination psude-state -> 🔘
-    // user tasks can override this if a custom termination needed
-    // todo: bu pointer event şeklinde kalmış, değiştirilecek
-    virtual HandleResult _terminationState(const std::shared_ptr<const Event>&);
+    // Entry deletes this task. Override for a custom termination.
+    HandleResult _terminationState(const Event&) override;
 
     // user task service methods
     void _subscribe(SignalId);

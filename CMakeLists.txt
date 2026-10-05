@@ -363,7 +363,6 @@ endif()
 # Task -> Actor
 # evaluate timer functionality with grok
 # task queue icin moodycamel::ConcurrentQueue dene
-# termination state StateMachine'e taşınacak
 # on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
 # CLI ve _getStateNameMap tekrar değerlendirilecek. _getStateNameMap kullanılmıyorsa kaldırılacak
 # AI uygulama usr/bin klasörüne yüklendiğinde orada LOG klasörü yaratamayacağı için XDG_STATE_HOME diye bir yere koydu logları. Burayı düzelt

@@ -34,6 +34,17 @@ protected:
         return HandleResult::Ignored;
     }
 
+    // termination psude-state -> 🔘
+    // Entry is handled. Every other signal goes to top. Override for a custom termination.
+    virtual HandleResult _terminationState(const Event& event) {
+        switch (event.signal) {
+            case ENTRY_SIG:
+                return _handled();
+            default:
+                return _super(&StateMachine::top);
+        }
+    }
+
     // macro-like functions for event handle returns (handled/unhandled/transiton/superstate)
     static constexpr HandleResult _handled(void) { return HandleResult::Handled; }
     static constexpr HandleResult _unhandled(void) { return HandleResult::Unhandled; } // because of a guard

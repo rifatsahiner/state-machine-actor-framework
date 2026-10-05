@@ -137,6 +137,35 @@ private:
     bool _saw{false};
 };
 
+class TermMachine : public uOS::StateMachine {
+public:
+    void check() {
+        init();
+        expect(isIn(static_cast<State>(&TermMachine::_terminationState)), "state machine enters termination");
+        expect(isIn(&TermMachine::top), "termination superstate is top");
+        dispatch(uOS::Event{42});
+        expect(isIn(static_cast<State>(&TermMachine::_terminationState)), "user signal stays in termination");
+    }
+
+private:
+    HandleResult _topInitialTrans(void) override { return _trans(&TermMachine::_terminationState); }
+};
+
+class TermChild : public uOS::ChildStateMachine<> {
+public:
+    TermChild(uOS::TaskId id, uOS::LogStream log) : ChildStateMachine(id, std::move(log)) {}
+
+    void check() {
+        init();
+        logStream().flush();
+        expect(isIn(static_cast<State>(&TermChild::_terminationState)), "child enters termination");
+        expect(isIn(&TermChild::top), "child termination superstate is top");
+    }
+
+private:
+    HandleResult _topInitialTrans(void) override { return _trans(&TermChild::_terminationState); }
+};
+
 class FactoryTask : public uOS::SyncTask {
 public:
     FactoryTask(uOS::TaskId id, std::string inst) : SyncTask(id, std::move(inst)) {}
@@ -228,6 +257,17 @@ int main() {
     const fs::path taskLog = newest(root / "CreateChildTask");
     expect(!taskLog.empty(), "createChild task log exists");
     expect(contains(taskLog, "create-child"), "child writes the task log");
+
+    TermMachine{}.check();
+
+    {
+        // 40 is not a framework task id. openTask only needs it as a log key.
+        auto stream = uOS::Logger::openTask("TermChild", "t1", 40);
+        TermChild child(40, std::move(stream));
+        child.check();
+    }
+    const fs::path termLog = newest(root / "TermChild");
+    expect(!termLog.empty() && contains(termLog, "ENTRY for TERMINATION-STATE"), "child logs termination entry");
 
     uOS::Logger::stop();
 

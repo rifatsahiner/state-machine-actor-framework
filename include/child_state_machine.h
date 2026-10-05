@@ -44,6 +44,15 @@ protected:
     // Reference to this machine's stream. Copy it to keep a handle.
     const LogStream& logStream() const { return _log; }
 
+    // termination psude-state -> 🔘
+    // Override for a custom termination.
+    HandleResult _terminationState(const Event& event) override {
+        if (event.signal == ENTRY_SIG) {
+            LOG(LogLevel::LOG_INFO, "ENTRY for TERMINATION-STATE");
+        }
+        return StateMachine::_terminationState(event);
+    }
+
     void postToParent(std::shared_ptr<const Event> event) const { FW::postEvent(_parentTaskId, std::move(event)); }
 
     TimerId postToParentIn(uint_fast16_t intervalMs, std::shared_ptr<const Event> event) const {
@@ -80,8 +89,7 @@ private:
     using Stored = std::conditional_t<std::is_void_v<Parent>, EmptyParent,
                                       std::conditional_t<std::is_lvalue_reference_v<Parent>, std::remove_reference_t<Parent>*, Parent>>;
 
-    template <class Arg>
-    static Stored makeParentData(Arg&& parent) {
+    template <class Arg> static Stored makeParentData(Arg&& parent) {
         if constexpr (std::is_lvalue_reference_v<Parent>) {
             return std::addressof(parent);
         } else {

@@ -58,11 +58,11 @@ void Task::cliEventSink(std::ostream& out, SignalId signalId, const nlohmann::js
 }
 #endif
 
-Task::HandleResult Task::_terminationState(const std::shared_ptr<const uOS::Event>& event){
+Task::HandleResult Task::_terminationState(const Event& event) {
     HandleResult res;
 
     // call self-delete on entry and discard all events
-    switch(event->signal) {
+    switch (event.signal) {
         case ENTRY_SIG : {
             LOG(LogLevel::LOG_INFO, "ENTRY for TERMINATION-STATE");
             _selfDelete();
