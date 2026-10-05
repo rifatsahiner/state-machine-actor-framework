@@ -3,13 +3,17 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "detail/parent_data.h"
 #include "log_stream.h"
 #include "state_machine.h"
 #ifdef uOS_ENABLE_CLI
@@ -21,6 +25,16 @@ class Menu;
 #endif
 
 namespace uOS {
+
+namespace detail {
+
+// Csm::ParentData, a legal parent argument, and a constructor of
+// (parent, own args..., TaskId, LogStream) or (own args..., TaskId, LogStream).
+template <class Csm, class... Args>
+concept ChildFactoryArgs = requires { typename Csm::ParentData; } && ParentFactoryArgs<typename Csm::ParentData, Args...> &&
+                           std::is_constructible_v<Csm, Args..., TaskId, const LogStream&>;
+
+} // namespace detail
 
 class Task : public StateMachine {
 public:
@@ -71,15 +85,28 @@ protected:
     void _registerCliMenu(std::unique_ptr<cli::Menu>&&);
 #endif
 
-    const TaskId _id;
-    std::queue<std::shared_ptr<const Event>> _eventQueue;
-    std::atomic<bool> _isRunning{false};
-
+    // event factory method
     template <class T = Event> std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt) {
         std::shared_ptr<T> e = uOS::new_e<T>(signalId);
         e->source = _id;
         return e;
     }
+
+    // child factory method
+    // Child constructor order is (ParentData, own args..., TaskId, LogStream),
+    // or (own args..., TaskId, LogStream) when ParentData is void.
+    // Call this only after Task::init. The task log is empty before that.
+    template <class Csm, class... Args>
+        requires detail::ChildFactoryArgs<Csm, Args...>
+    std::unique_ptr<Csm> createChild(Args&&... args) {
+        ASSERT_FOR_FATAL(static_cast<bool>(logStream()));
+        return std::make_unique<Csm>(std::forward<Args>(args)..., _id, logStream());
+    }
+
+    // protected members
+    const TaskId _id;
+    std::queue<std::shared_ptr<const Event>> _eventQueue;
+    std::atomic<bool> _isRunning{false};
 
 private:
     virtual std::string _getTaskName(void) const = 0;

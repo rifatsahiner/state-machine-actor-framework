@@ -5,16 +5,23 @@
 #include <type_traits>
 #include <utility>
 
+#include "detail/parent_data.h"
 #include "log_stream.h"
 #include "state_machine.h"
 
 namespace uOS {
 
-// Included from uOS.h after class FW is defined.
-// The Shared& constructor and parentData() are member templates so
-// ChildStateMachine<void> never forms a void& parameter.
-template <class Shared = void> class ChildStateMachine : public StateMachine {
+// ParentData is the view of the parent task:
+//   void                         no parent view
+//   an lvalue reference          pointer to that task member; pass it by name
+//   an object (struct or tuple)  stored by value; a temporary view may be moved in
+// createChild rejects a temporary when ParentData is a reference.
+template <class Parent = void> class ChildStateMachine : public StateMachine {
 public:
+    using ParentData = Parent;
+
+    static_assert(!std::is_rvalue_reference_v<Parent>, "ParentData cannot be an rvalue reference");
+
     ChildStateMachine(const ChildStateMachine&) = delete;
     ChildStateMachine(ChildStateMachine&&) = delete;
     ChildStateMachine& operator=(const ChildStateMachine&) = delete;
@@ -22,13 +29,15 @@ public:
 
 protected:
     ChildStateMachine(TaskId parentTaskId, LogStream log)
-        requires std::is_void_v<Shared>
-        : _parentTaskId(parentTaskId), _log(std::move(log)) {}
+        requires std::is_void_v<Parent>
+        : _parentTaskId(parentTaskId), _log(std::move(log)), _parentData{} {}
 
-    template <class S = Shared>
-        requires(!std::is_void_v<S> && std::is_same_v<S, Shared>)
-    ChildStateMachine(std::type_identity_t<S>& shared, TaskId parentTaskId, LogStream log)
-        : _parentTaskId(parentTaskId), _log(std::move(log)), _shared(&shared) {}
+    // Arg&& keeps the value category. A reference parameter would bind a
+    // temporary and hide it from this constraint.
+    template <class Arg>
+        requires(!std::is_void_v<Parent> && detail::ParentBindable<Parent, Arg>)
+    ChildStateMachine(Arg&& parent, TaskId parentTaskId, LogStream parentStream)
+        : _parentTaskId(parentTaskId), _log(std::move(parentStream)), _parentData(makeParentData(std::forward<Arg>(parent))) {}
 
     TaskId parentTaskId() const noexcept { return _parentTaskId; }
 
@@ -41,24 +50,48 @@ protected:
         return FW::postEventIn(intervalMs, _parentTaskId, std::move(event));
     }
 
-    template <class S = Shared>
-        requires(!std::is_void_v<S> && std::is_same_v<S, Shared>)
-    S& parentData() noexcept {
-        return *_shared;
+    template <class P = Parent>
+        requires(!std::is_void_v<P> && std::is_same_v<P, Parent> && std::is_lvalue_reference_v<P>)
+    std::remove_reference_t<P>& parentData() noexcept {
+        return *_parentData;
     }
 
-    template <class S = Shared>
-        requires(!std::is_void_v<S> && std::is_same_v<S, Shared>)
-    const S& parentData() const noexcept {
-        return *_shared;
+    template <class P = Parent>
+        requires(!std::is_void_v<P> && std::is_same_v<P, Parent> && std::is_lvalue_reference_v<P>)
+    const std::remove_reference_t<P>& parentData() const noexcept {
+        return *_parentData;
+    }
+
+    template <class P = Parent>
+        requires(!std::is_void_v<P> && std::is_same_v<P, Parent> && !std::is_lvalue_reference_v<P>)
+    P& parentData() noexcept {
+        return _parentData;
+    }
+
+    template <class P = Parent>
+        requires(!std::is_void_v<P> && std::is_same_v<P, Parent> && !std::is_lvalue_reference_v<P>)
+    const P& parentData() const noexcept {
+        return _parentData;
     }
 
 private:
-    struct EmptyShared {};
+    struct EmptyParent {};
+
+    using Stored = std::conditional_t<std::is_void_v<Parent>, EmptyParent,
+                                      std::conditional_t<std::is_lvalue_reference_v<Parent>, std::remove_reference_t<Parent>*, Parent>>;
+
+    template <class Arg>
+    static Stored makeParentData(Arg&& parent) {
+        if constexpr (std::is_lvalue_reference_v<Parent>) {
+            return std::addressof(parent);
+        } else {
+            return Stored(std::forward<Arg>(parent));
+        }
+    }
 
     TaskId _parentTaskId{};
     LogStream _log;
-    std::conditional_t<std::is_void_v<Shared>, EmptyShared, Shared*> _shared{};
+    Stored _parentData;
 };
 
 } // namespace uOS

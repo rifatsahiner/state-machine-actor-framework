@@ -354,18 +354,20 @@ install(FILES "${PROJECT_BINARY_DIR}/uOS.pc"
 if(uOS_BUILD_TESTS)
     add_executable(log_stream_test tests/log_stream_test.cpp)
     target_link_libraries(log_stream_test PRIVATE ${PROJECT_NAME})
+    add_executable(create_child_test tests/create_child_test.cpp)
+    target_link_libraries(create_child_test PRIVATE ${PROJECT_NAME})
 endif()
 
 
 
-# Tasklara create-child-SM benzeri bir function template tanımlanabilir mi düşünülecek -> log stream kullananlar task constructor'ından çağırılmaması gerekiyor
 # Task -> Actor
 # evaluate timer functionality with grok
+# task queue icin moodycamel::ConcurrentQueue dene
+# termination state StateMachine'e taşınacak
 # on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
 # CLI ve _getStateNameMap tekrar değerlendirilecek. _getStateNameMap kullanılmıyorsa kaldırılacak
-# task queue icin moodycamel::ConcurrentQueue dene
 # AI uygulama usr/bin klasörüne yüklendiğinde orada LOG klasörü yaratamayacağı için XDG_STATE_HOME diye bir yere koydu logları. Burayı düzelt
-# reduce standard requirement to c++17
+# reduce standard requirement to c++17. düşürmek mantıklı değil, zaten yeni projeleri hedefliyoruz. c++20 için genel olarak review yapılmalı
 
 # diğer işlerden önce fark edilmek için example ekle
 # sistemdeki eventleri izlemek için bir tool yazılımı yapılacak (AI ile yap)
