@@ -473,6 +473,10 @@ void FW::resumeTask(TaskId taskId, bool cleanStart) {
 }
 
 void FW::deleteTask(TaskId taskId) {
+    if (taskId == NO_TASK_ID) {
+        return;
+    }
+
     SLOG(LogLevel::LOG_INFO, "Deleting task with id: {}", taskId);
 
     // stop task
@@ -495,6 +499,8 @@ void FW::deleteTask(TaskId taskId) {
             _syncTaskList.erase(syncTaskIt);
         }
         ASSERT_FOR_FATAL(_taskMap.erase(taskId) == 1);
+        ASSERT_FOR_FATAL(taskId != NO_TASK_ID);
+        ASSERT_FOR_FATAL(taskId < uOS_FW_MAX_TASK_COUNT);
         _taskIdUsageList[taskId] = false;
 
 #ifdef uOS_ENABLE_CLI
@@ -754,9 +760,8 @@ void FW::_publishEventCommon(std::shared_ptr<const Event>&& event, std::vector<T
 }
 
 TaskId FW::_getAvailableTaskId(void) {
-    uint_fast16_t i;
-
-    for (i = 0; i < uOS_FW_MAX_TASK_COUNT; i++) {
+    // Id 0 is NO_TASK_ID and is never issued.
+    for (uint_fast16_t i = 1; i < uOS_FW_MAX_TASK_COUNT; i++) {
         if (_taskIdUsageList[i] == false) {
             _taskIdUsageList[i] = true;
             return static_cast<TaskId>(i);

@@ -80,7 +80,7 @@ private:
 
     static volatile inline bool _isRunning = true;
 
-    // task related
+    // task related. Ids 1 .. MAX-1; NO_TASK_ID is never stored.
     static inline std::array<bool, uOS_FW_MAX_TASK_COUNT> _taskIdUsageList;
     static inline std::unordered_map<TaskId, std::shared_ptr<Task>> _taskMap;
     static inline std::vector<std::shared_ptr<SyncTask>> _syncTaskList;
@@ -116,7 +116,7 @@ private:
     static TimerId _getAvailableTimerId(void);
     static void _releaseTimerId(TimerId);
     static void _insertTimerQueue(TimerId, uint_fast16_t);
-    static TimerId _setupTimedEvent(bool, bool, uint_fast16_t, std::shared_ptr<const Event>&&, TaskId receiverTaskId = 0);
+    static TimerId _setupTimedEvent(bool, bool, uint_fast16_t, std::shared_ptr<const Event>&&, TaskId receiverTaskId = NO_TASK_ID);
     static void _handleTick(void);
     static void _handleDelete(void);
     static void _publishEvent(std::shared_ptr<const Event>&&);

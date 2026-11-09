@@ -356,13 +356,16 @@ if(uOS_BUILD_TESTS)
     target_link_libraries(log_stream_test PRIVATE ${PROJECT_NAME})
     add_executable(create_child_test tests/create_child_test.cpp)
     target_link_libraries(create_child_test PRIVATE ${PROJECT_NAME})
+    add_executable(task_id_test tests/task_id_test.cpp)
+    target_link_libraries(task_id_test PRIVATE ${PROJECT_NAME})
 endif()
 
 
 
 # Task -> Actor
 # evaluate timer functionality with grok
-# task queue icin moodycamel::ConcurrentQueue dene
+# task queue icin moodycamel::ConcurrentQueue dene. evaluate queue functionality with grok
+# error ve warning loglar ayrı bir dosyada tutulabilir mi? tüm errorları tek yerde görebilmek için
 # on deleteTask -> task queue'de bulunan eventleri bitirsin mi?
 # CLI ve _getStateNameMap tekrar değerlendirilecek. _getStateNameMap kullanılmıyorsa kaldırılacak
 # AI uygulama usr/bin klasörüne yüklendiğinde orada LOG klasörü yaratamayacağı için XDG_STATE_HOME diye bir yere koydu logları. Burayı düzelt

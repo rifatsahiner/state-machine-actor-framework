@@ -31,6 +31,9 @@ using TaskId = uint_fast16_t;
 using TaskId = uint_fast8_t;
 #endif
 
+// Not a live task. Allocation never returns this value. Distinct from isTaskIdle.
+constexpr TaskId NO_TASK_ID = 0;
+
 // signal
 using SignalId = uint_fast16_t;
 
