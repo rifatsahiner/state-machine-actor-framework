@@ -16,6 +16,7 @@
 #include "uOS.h"
 
 #include "detail/logger.h"
+#include "detail/sync_task_scanner.h"
 
 using namespace std::chrono_literals;
 
@@ -24,6 +25,13 @@ namespace uOS {
 namespace {
 
 volatile std::sig_atomic_t g_stopSignal = 0;
+
+void runSyncSnapshot(void* ctx, size_t begin, size_t end) {
+    auto* snapshot = static_cast<std::vector<SyncTask*>*>(ctx);
+    for (size_t i = begin; i < end; ++i) {
+        (*snapshot)[i]->runCycle();
+    }
+}
 
 void logStopSignal() {
     if (g_stopSignal == 0) {
@@ -77,6 +85,8 @@ void FW::init(int argc, char* argv[], const std::string& appName) {
     _taskMap.clear();
     _syncTaskList.clear();
     _syncTaskList.reserve(uOS_FW_MAX_TASK_COUNT);
+    _syncScanActive = false;
+    _syncScanGraveyard.clear();
     _subsMap.clear();
     _deleteList.clear();
 
@@ -199,7 +209,6 @@ int32_t FW::run() {
     uint_fast8_t h = 0;
     std::chrono::milliseconds::rep maxLoopDuration = 0;
     uint_fast32_t loopOverrunCount = 0;
-    std::vector<std::shared_ptr<uOS::SyncTask>> syncTaskListCopy{};
 
     // onStartup() aşağıdaki satırlar
     // struct termios tio;                        // modified terminal attributes
@@ -214,102 +223,50 @@ int32_t FW::run() {
     // sparam.sched_priority = sched_get_priority_max(SCHED_FIFO);
     // pthread_setschedparam(pthread_self(), SCHED_FIFO, &sparam) == 0;
 
-#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
-    // setup sync task thread pool
-    std::atomic<uint_fast8_t> activeThreadsNeeded{0};
-    std::atomic<uint_fast8_t> threadsFinished{0};
-    std::atomic<bool> poolRunning{true};
-    std::atomic<uint_fast64_t> currentWorkCycle{0};
-
-    std::mutex poolMutex;
-    std::condition_variable cvStart;
-    std::condition_variable cvDone;
-
-    auto syncTaskProcessWorker = [&](int threadId) {
-        prepareLogThread();
-        uint64_t lastProcessedCycle = 0; // Local to each thread
-
-        while (poolRunning) {
-            std::unique_lock<std::mutex> lock(poolMutex);
-            // Wait until pool stops OR a NEW cycle has started for this thread
-            cvStart.wait(lock, [&] { return !poolRunning || (currentWorkCycle > lastProcessedCycle && threadId < activeThreadsNeeded); });
-
-            if (!poolRunning)
-                return;
-
-            // Mark this cycle as "in progress" for this thread
-            lastProcessedCycle = currentWorkCycle;
-            lock.unlock();
-
-            // --- STATIC PARTITIONING LOGIC ---
-            size_t totalTasks = syncTaskListCopy.size();
-            int nThreads = activeThreadsNeeded;
-
-            size_t tasksPerThread = totalTasks / nThreads;
-            size_t remainder = totalTasks % nThreads;
-
-            size_t start = threadId * tasksPerThread + std::min((size_t)threadId, remainder);
-            size_t end = start + tasksPerThread + (static_cast<size_t>(threadId) < remainder ? 1 : 0);
-
-            for (size_t i = start; i < end; ++i) {
-                syncTaskListCopy[i]->runCycle();
-            }
-
-            // Atomically check-in
-            if (++threadsFinished == nThreads) {
-                cvDone.notify_one();
-            }
-        }
-    };
-
-    std::vector<std::thread> threadPool;
-    for (size_t i = 0; i < uOS_FW_SYNC_TASK_THREAD_POOL_SIZE; ++i) {
-        threadPool.emplace_back(syncTaskProcessWorker, i);
-    }
-#endif
+    // Pool covers a full task table. The FW thread is one of the scan threads.
+    const size_t extraScanWorkers = syncScanThreadCount(static_cast<size_t>(uOS_FW_MAX_TASK_COUNT)) - 1;
+    SyncTaskScanner syncScanner(extraScanWorkers, prepareLogThread);
 
     // start logger
     Logger::start();
     SLOG(uOS::LogLevel::LOG_INFO, "Welcome to uOS application...");
     SLOG(uOS::LogLevel::LOG_INFO, "FW run loop entry");
 
-    // reserve sync task copy buffer and get the start time
-    syncTaskListCopy.reserve(uOS_FW_MAX_TASK_COUNT);
+    std::vector<SyncTask*> syncSnapshot;
+    syncSnapshot.reserve(uOS_FW_MAX_TASK_COUNT);
     auto wakeup = std::chrono::steady_clock::now();
 
     //
     // main framework loop
     //
     while (_isRunning) {
-        // handle sync tasks
+        // Registered sync tasks. Thread count is snapshot size / TASKS_PER_THREAD + 1.
+        // A post into another slice may run this tick or the next.
+        bool scanning = false;
         {
-            std::shared_lock lock(_taskMutex);
-            syncTaskListCopy = _syncTaskList;
+            // Unique lock: the copy is a pointer memcpy, and it publishes _syncScanActive.
+            std::unique_lock lock(_taskMutex);
+            syncSnapshot.assign(_syncTaskList.begin(), _syncTaskList.end());
+            if (!syncSnapshot.empty()) {
+                _syncScanActive = true;
+                scanning = true;
+            }
         }
 
-        if (!syncTaskListCopy.empty()) {
-            if (syncTaskListCopy.size() < 256) {
-                // Direct execution for small number of sync tasks
-                for (const auto& syncTaskPtr : syncTaskListCopy) {
-                    syncTaskPtr->runCycle();
+        if (scanning) {
+            // Destroyed before timers, including when a slice throws.
+            struct ScanGuard {
+                std::vector<SyncTask*>* snapshot;
+                explicit ScanGuard(std::vector<SyncTask*>* snapshot_) : snapshot(snapshot_) {}
+                ScanGuard(const ScanGuard&) = delete;
+                ScanGuard& operator=(const ScanGuard&) = delete;
+                ~ScanGuard() {
+                    _finishSyncScan();
+                    snapshot->clear();
                 }
-            }
-#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
-            else {
-                // Use thread pool for large number of sync tasks
-                threadsFinished = 0;
+            } guard{&syncSnapshot};
 
-                // Ensure calculation doesn't exceed pool size
-                activeThreadsNeeded = std::min((int)uOS_FW_SYNC_TASK_THREAD_POOL_SIZE, (int)(syncTaskListCopy.size() / 256) + 1);
-
-                currentWorkCycle++;
-                cvStart.notify_all();
-
-                std::unique_lock<std::mutex> lock(poolMutex);
-                cvDone.wait(lock, [&] { return threadsFinished == activeThreadsNeeded; });
-            }
-#endif
-            syncTaskListCopy.clear();
+            syncScanner.run(syncSnapshot.size(), &syncSnapshot, runSyncSnapshot);
         }
 
         // handle timers
@@ -362,13 +319,8 @@ int32_t FW::run() {
 
     logStopSignal();
 
-#ifdef uOS_FW_SYNC_TASK_THREAD_POOL_SIZE
-    // sync task thread pool cleanup
-    poolRunning = false;
-    cvStart.notify_all();
-    for (auto& t : threadPool)
-        t.join();
-#endif
+    // Join scan workers before any task destructor runs.
+    syncScanner.shutdown();
 
     // terminate all task loops
     SLOG(uOS::LogLevel::LOG_INFO, "FW run loop exit. Stopping all tasks");
@@ -380,14 +332,17 @@ int32_t FW::run() {
     } // drop the shared lock before any destructor can post
 
     std::unordered_map<TaskId, std::shared_ptr<Task>> dyingTasks;
-    std::vector<std::shared_ptr<SyncTask>> dyingSync;
+    std::vector<std::shared_ptr<Task>> dyingHeld;
     {
         std::unique_lock writeLock(_taskMutex);
-        _syncTaskList.swap(dyingSync);
+        _syncTaskList.clear();
+        _syncScanActive = false;
+        _syncScanGraveyard.swap(dyingHeld);
         _taskMap.swap(dyingTasks);
     } // map is empty: _findTask() now returns nullptr
 
-    dyingSync.clear();
+    // Graveyard destructors may postEvent. The map is already empty, so that misses.
+    _retireTasks(std::move(dyingHeld));
     dyingTasks.clear(); // NsaUeTask::~NsaUeTask may postEvent; that is now a no-op
 
     // terminate logger
@@ -472,6 +427,72 @@ void FW::resumeTask(TaskId taskId, bool cleanStart) {
     task->resume(cleanStart);
 }
 
+void FW::_retireTasks(std::vector<std::shared_ptr<Task>> dying) {
+    // ~Task may re-enter FW and take _taskMutex. TaskRelease frees the id after
+    // that destructor returns. Clearing the bit here would race a reused id, and
+    // would free an id whose object another shared_ptr still owns.
+    dying.clear();
+}
+
+void FW::_releaseTaskId(TaskId taskId) {
+    std::lock_guard lock(_taskMutex);
+    ASSERT_FOR_FATAL(taskId != NO_TASK_ID);
+    ASSERT_FOR_FATAL(taskId < uOS_FW_MAX_TASK_COUNT);
+    _taskIdUsageList[taskId] = false;
+}
+
+void FW::_dropTaskRegistrations(TaskId taskId) {
+    {
+        auto checkSubsId = [taskId](TaskId subsId) { return subsId == taskId; };
+        std::lock_guard<std::mutex> subsLock(_subsMutex);
+        for (auto& pair : _subsMap) {
+            auto& subsList = pair.second;
+            auto it = std::find_if(subsList.begin(), subsList.end(), checkSubsId);
+            if (it != subsList.end()) {
+                subsList.erase(it);
+            }
+        }
+    }
+
+    std::vector<TimerId> receiverTimers;
+    std::lock_guard<std::mutex> timerLock(_timerMutex);
+    for (const auto& pair : _timerStorageMap) {
+        const TimerNode& node = pair.second;
+        if (!node.isPublish && node.receiverTaskId == taskId) {
+            receiverTimers.push_back(pair.first);
+        }
+    }
+
+    // A timer already popped by _handleTick is in storage and not in the queue.
+    // That tick holds the storage node and releases it when the receiver is gone.
+    for (TimerId timerId : receiverTimers) {
+        auto itPrev = _timerQueue.cbefore_begin();
+        for (auto itCancel = _timerQueue.begin(); itCancel != _timerQueue.cend(); ++itCancel) {
+            if (itCancel->first == timerId) {
+                auto itNext = std::next(itCancel);
+                if (itNext != _timerQueue.cend()) {
+                    itNext->second += itCancel->second;
+                }
+                _timerQueue.erase_after(itPrev);
+                _timerStorageMap.erase(timerId);
+                _releaseTimerId(timerId);
+                break;
+            }
+            itPrev = itCancel;
+        }
+    }
+}
+
+void FW::_finishSyncScan(void) {
+    std::vector<std::shared_ptr<Task>> dead;
+    {
+        std::lock_guard lock(_taskMutex);
+        _syncScanActive = false;
+        dead.swap(_syncScanGraveyard);
+    }
+    _retireTasks(std::move(dead));
+}
+
 void FW::deleteTask(TaskId taskId) {
     if (taskId == NO_TASK_ID) {
         return;
@@ -482,6 +503,7 @@ void FW::deleteTask(TaskId taskId) {
     // stop task
     stopTask(taskId, true);
 
+    std::shared_ptr<Task> owned;
     {
         std::lock_guard taskLock(_taskMutex);
         auto taskIter = _taskMap.find(taskId);
@@ -492,16 +514,21 @@ void FW::deleteTask(TaskId taskId) {
         std::string taskName = taskIter->second->getName();
 #endif
 
-        // delete from map, make its taskId available and remove from sync task list if necessary
-        if (auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(taskIter->second)) {
-            auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTaskPtr);
+        owned = std::move(taskIter->second);
+
+        // Unlink the map entry and the sync-list pointer. TaskRelease makes the id available after ~Task.
+        if (auto* syncTask = dynamic_cast<SyncTask*>(owned.get())) {
+            auto syncTaskIt = std::find(_syncTaskList.begin(), _syncTaskList.end(), syncTask);
             ASSERT_FOR_FATAL(syncTaskIt != _syncTaskList.end());
             _syncTaskList.erase(syncTaskIt);
         }
         ASSERT_FOR_FATAL(_taskMap.erase(taskId) == 1);
-        ASSERT_FOR_FATAL(taskId != NO_TASK_ID);
-        ASSERT_FOR_FATAL(taskId < uOS_FW_MAX_TASK_COUNT);
-        _taskIdUsageList[taskId] = false;
+
+        // The scan holds this raw pointer. Park the object; TaskRelease frees the id
+        // after the scan joins and ~Task returns. The bit stays set either way.
+        if (_syncScanActive) {
+            _syncScanGraveyard.push_back(std::move(owned));
+        }
 
 #ifdef uOS_ENABLE_CLI
         // remove its cli menu if necessary
@@ -524,15 +551,15 @@ void FW::deleteTask(TaskId taskId) {
 #endif
     }
 
-    // clear its subscriptions
-    auto checkSubsId = [taskId](TaskId subsId) { return subsId == taskId; };
-    std::lock_guard<std::mutex> subsLock(_subsMutex);
-    for (auto& pair : _subsMap) {
-        auto& subsList = pair.second;
-        auto it = std::find_if(subsList.begin(), subsList.end(), checkSubsId);
-        if (it != subsList.end()) {
-            subsList.erase(it);
-        }
+    // Subscriptions and receiver timers, while this id is still reserved.
+    // The id is freed later, after ~Task returns.
+    _dropTaskRegistrations(taskId);
+
+    // Destructor may re-enter FW. Do this after the registration locks are released.
+    if (owned) {
+        std::vector<std::shared_ptr<Task>> dying;
+        dying.push_back(std::move(owned));
+        _retireTasks(std::move(dying));
     }
 }
 
@@ -878,6 +905,7 @@ void FW::_handleTick(void) // todo: inline yap
 
             // event'i post et
             // todo: event'i move edersem periyodik olarak tekrar çağırıldığında event kaybolmuyor mu?
+            bool receiverGone = false;
             if (timerNode.isPublish) {
                 if (timerNode.isPeriodic == false)
                     _publishEvent(std::move(timerNode.eventPtr));
@@ -896,14 +924,15 @@ void FW::_handleTick(void) // todo: inline yap
                         it->second->putEvent(std::move(eventCopy));
                     }
                 } else {
+                    receiverGone = true;
                     SLOG(LogLevel::LOG_WARNING, "Timer expired for deleted task with id: {} ", timerNode.receiverTaskId);
                 }
             }
 
-            // periodikse tekrar ekle
-            // periyodik değilse storage erase yap
+            // A periodic timer for a live receiver is armed again. Anything else,
+            // including a periodic timer whose task is gone, releases the timer id.
             lock.lock();
-            if (timerNode.isPeriodic) {
+            if (timerNode.isPeriodic && !receiverGone) {
                 _insertTimerQueue(timerId,
                                   (timerNode.interval - 1)); // -tam nedenini çözemedim ama 20ms fazla çıkıyor periyodiklerde, o yüzden -1 yaptım
             } else {

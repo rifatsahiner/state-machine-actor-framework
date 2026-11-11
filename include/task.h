@@ -150,6 +150,11 @@ public:
     void stop(bool waitJoin = true) override;
     void resume(bool cleanStart = true) override;
     void putEvent(std::shared_ptr<const Event>&& event) override;
+    // Below uOS_FW_SYNC_TASKS_PER_THREAD registered sync tasks, the framework
+    // walks them in order on the caller, so a post to a later sync task still
+    // runs in this sweep. At that count and above, slices run together and a
+    // post to another sync task may run in this sweep or the next. Handlers
+    // that share mutable data across tasks need their own synchronization.
     void runCycle(void);
 #ifndef NDEBUG
     bool isIdle(void) override;

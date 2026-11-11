@@ -1,17 +1,24 @@
 #ifndef uOS_DEFS_H
 #define uOS_DEFS_H
 
-#include <cstdint>
-#include <optional>
-#include <memory>
 #include <cassert>
+#include <cstdint>
+#include <memory>
+#include <optional>
 
-#define uOS_FW_MAX_TASK_COUNT 128
-#define uOS_FW_MAX_TIMER_COUNT 256
+#define uOS_FW_MAX_TASK_COUNT 1024
+#define uOS_FW_MAX_TIMER_COUNT 2048
 
+// One more scan thread per this many registered sync tasks.
+// thread_count = count / uOS_FW_SYNC_TASKS_PER_THREAD + 1
+// 144 puts 1024 tasks on 8 threads. A CPU-only sweep on this 8-thread
+// machine was a little faster at 16, and 8 stayed within 15% of that on a
+// warm run. Five threads, from a 256 divisor, stayed outside that band.
+#ifndef uOS_FW_SYNC_TASKS_PER_THREAD
+#define uOS_FW_SYNC_TASKS_PER_THREAD 144
+#endif
 
 namespace uOS {
-
 
 // timerId
 #if uOS_FW_MAX_TIMER_COUNT > 65536
@@ -26,7 +33,6 @@ constexpr TimerId IDLE_TIMER_ID = 0;
 // taskId
 #if uOS_FW_MAX_TASK_COUNT > 256
 using TaskId = uint_fast16_t;
-#define uOS_FW_SYNC_TASK_THREAD_POOL_SIZE 8
 #else
 using TaskId = uint_fast8_t;
 #endif
@@ -52,18 +58,15 @@ struct Event {
     SignalId signal;
     std::optional<TaskId> source;
 
-    constexpr Event(SignalId s = 0, std::optional<TaskId> src = std::nullopt)
-        : signal(s), source(src) {}
+    constexpr Event(SignalId s = 0, std::optional<TaskId> src = std::nullopt) : signal(s), source(src) {}
 
     virtual ~Event() = default;
 };
 
 // event utility
-template <class T = Event>
-std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
-{
+template <class T = Event> std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt) {
     static_assert(std::is_base_of_v<Event, T>);
-    
+
     auto ptr = std::make_shared<T>();
     if (signalId) {
         ptr->signal = signalId.value();
@@ -71,15 +74,13 @@ std::shared_ptr<T> new_e(std::optional<SignalId> signalId = std::nullopt)
     return ptr;
 }
 
-template <class T>
-const T& recast_e(const Event& eventRef) {
+template <class T> const T& recast_e(const Event& eventRef) {
     static_assert(std::is_base_of_v<Event, T>);
 #ifndef NDEBUG
     // exact runtime type check in debug mode
     if (typeid(eventRef) != typeid(T)) {
-        throw std::runtime_error("Type mismatch in recast_e: Expected exactly " + 
-                                 std::string(typeid(T).name()) + 
-                                 ", got " + std::string(typeid(eventRef).name()));
+        throw std::runtime_error("Type mismatch in recast_e: Expected exactly " + std::string(typeid(T).name()) + ", got " +
+                                 std::string(typeid(eventRef).name()));
     }
 #endif
     return static_cast<const T&>(eventRef);
@@ -103,30 +104,28 @@ enum class LogLevel : uint8_t {
 
 // define the unreachable intrinsic based on compiler
 #if defined(_MSC_VER)
-    #define FW_UNREACHABLE() __assume(0)
+#define FW_UNREACHABLE() __assume(0)
 #elif defined(__GNUC__) || defined(__clang__)
-    #define FW_UNREACHABLE() __builtin_unreachable()
+#define FW_UNREACHABLE() __builtin_unreachable()
 #else
-    #define FW_UNREACHABLE()
+#define FW_UNREACHABLE()
 #endif
 
 // custom assert for fatal errors that uses regulear assert in debug mode and aborts in release mode
 #ifdef NDEBUG
-    // Release Build: Abort and hint to the compiler that this is unreachable
-    #define ASSERT_FOR_FATAL(expr) \
-        do {                             \
-            if (!(expr)) {               \
-                std::abort();            \
-                FW_UNREACHABLE();        \
-            }                            \
-        } while (0)
+// Release Build: Abort and hint to the compiler that this is unreachable
+#define ASSERT_FOR_FATAL(expr)                                                                                                                       \
+    do {                                                                                                                                             \
+        if (!(expr)) {                                                                                                                               \
+            std::abort();                                                                                                                            \
+            FW_UNREACHABLE();                                                                                                                        \
+        }                                                                                                                                            \
+    } while (0)
 #else
-    // Debug Build: Use standard assert for breakpoints
-    #define ASSERT_FOR_FATAL(expr) assert(expr)
+// Debug Build: Use standard assert for breakpoints
+#define ASSERT_FOR_FATAL(expr) assert(expr)
 #endif
 
+} // namespace uOS
 
-}   // namespace uOS
-
-
-#endif  // uOS_DEFS_H
+#endif // uOS_DEFS_H

@@ -51,6 +51,7 @@ set(SOURCES
     ${SRC_DIR}/task.cpp
     ${SRC_DIR}/async_task.cpp
     ${SRC_DIR}/sync_task.cpp
+    ${SRC_DIR}/sync_task_scanner.cpp
     ${SRC_DIR}/logger.cpp)
 if(uOS_ENABLE_TUI)
     list(APPEND SOURCES ${SRC_DIR}/flogview.cpp)

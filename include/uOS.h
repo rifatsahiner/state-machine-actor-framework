@@ -83,7 +83,14 @@ private:
     // task related. Ids 1 .. MAX-1; NO_TASK_ID is never stored.
     static inline std::array<bool, uOS_FW_MAX_TASK_COUNT> _taskIdUsageList;
     static inline std::unordered_map<TaskId, std::shared_ptr<Task>> _taskMap;
-    static inline std::vector<std::shared_ptr<SyncTask>> _syncTaskList;
+    // Non-owning pointers. _taskMap owns the task until deleteTask unlinks it.
+    // A delete during a scan parks that shared_ptr in _syncScanGraveyard, so the
+    // snapshot pointer stays valid until the scan finishes. The id stays reserved
+    // until TaskRelease runs after the destructor returns.
+    // _syncScanActive is only touched while _taskMutex is held.
+    static inline std::vector<SyncTask*> _syncTaskList;
+    static inline bool _syncScanActive = false;
+    static inline std::vector<std::shared_ptr<Task>> _syncScanGraveyard;
     static inline std::shared_mutex _taskMutex;
     static inline std::vector<TaskId> _deleteList;
     static inline std::mutex _listMutex;
@@ -119,6 +126,12 @@ private:
     static TimerId _setupTimedEvent(bool, bool, uint_fast16_t, std::shared_ptr<const Event>&&, TaskId receiverTaskId = NO_TASK_ID);
     static void _handleTick(void);
     static void _handleDelete(void);
+    static void _finishSyncScan(void);
+    // Drops these references outside _taskMutex. TaskRelease frees each id.
+    static void _retireTasks(std::vector<std::shared_ptr<Task>> dying);
+    static void _releaseTaskId(TaskId taskId);
+    // Subs and receiver timers for this id. Call with the id still reserved and _taskMutex released.
+    static void _dropTaskRegistrations(TaskId taskId);
     static void _publishEvent(std::shared_ptr<const Event>&&);
     static void _publishEventCommon(std::shared_ptr<const Event>&&, std::vector<TaskId>&);
     static void _sigintHandler(int signum);
@@ -155,30 +168,54 @@ private:
     friend class Task;
     friend class AsyncTask;
 
+    // Frees the id after ~T returns. Every copy of the shared_ptr shares this
+    // deleter, so the id stays reserved while createTask holds the object across init().
+    template <class T> struct TaskRelease {
+        TaskId id;
+        void operator()(T* task) const {
+            delete task;
+            _releaseTaskId(id);
+        }
+    };
+
 public:
     // task logger is not ready until _topInitialTrans. create logging members there and not on task constructor
     template <class T, class... TaskArgs> static TaskId createTask(std::string taskName = "no-name-inst", TaskArgs&&... taskArgs) {
-        decltype(_taskMap)::iterator iter;
-
         static_assert(std::is_base_of_v<Task, T>);
+
+        TaskId newTaskId = NO_TASK_ID;
+        std::shared_ptr<Task> task;
+        {
+            std::lock_guard lock(_taskMutex);
+            newTaskId = _getAvailableTaskId();
+        }
+
+        // Outside the lock: TaskRelease takes _taskMutex after the destructor,
+        // and a constructor that re-enters FW must not nest that lock.
+        // A throwing constructor never builds the shared_ptr, so release the id here.
+        T* created = nullptr;
+        try {
+            created = new T(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...);
+        } catch (...) {
+            _dropTaskRegistrations(newTaskId);
+            _releaseTaskId(newTaskId);
+            throw;
+        }
+        task = std::shared_ptr<T>(created, TaskRelease<T>{newTaskId});
 
         {
             std::lock_guard lock(_taskMutex);
-            bool result;
-
-            TaskId newTaskId = FW::_getAvailableTaskId();
-
-            std::tie(iter, result) =
-                _taskMap.try_emplace(newTaskId, std::make_shared<T>(newTaskId, std::move(taskName), std::forward<TaskArgs>(taskArgs)...));
-            ASSERT_FOR_FATAL(result == true);
-            if (auto syncTaskPtr = std::dynamic_pointer_cast<SyncTask>(iter->second)) {
-                _syncTaskList.push_back(std::move(syncTaskPtr));
+            const bool inserted = _taskMap.try_emplace(newTaskId, task).second;
+            ASSERT_FOR_FATAL(inserted == true);
+            if (auto* syncTask = dynamic_cast<SyncTask*>(task.get())) {
+                _syncTaskList.push_back(syncTask);
             }
         }
 
-        iter->second->init(); // see function body for explanation
-
-        return iter->first;
+        // Pure virtuals are unavailable in the constructor. `task` keeps the object
+        // alive if deleteTask unlinks it here; the map iterator would not.
+        task->init();
+        return newTaskId;
     }
 };
 
