@@ -69,6 +69,16 @@ bool capturedHas(std::string_view needle) {
     return false;
 }
 
+int capturedCount(std::string_view needle) {
+    int count = 0;
+    for (const auto& line : uOS::Logger::capturedUi()) {
+        if (line.find(needle) != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 class Probe : public uOS::ChildStateMachine<> {
 public:
     Probe(uOS::TaskId id, uOS::LogStream log) : ChildStateMachine(id, std::move(log)) {}
@@ -84,6 +94,21 @@ public:
 
 private:
     std::string _getTaskName(void) const override { return "NamedTask"; }
+    std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const override { return {}; }
+    HandleResult _topInitialTrans(void) override { return HandleResult::Ignored; }
+};
+
+// deleteTask unlinks the task before the destructor. Subscribing here leaves
+// an id on the signal that is no longer in the task map.
+class PubProbe : public uOS::SyncTask {
+public:
+    static constexpr uOS::SignalId kSignal = 200;
+
+    PubProbe(uOS::TaskId id, std::string inst) : SyncTask(id, std::move(inst)) {}
+    ~PubProbe() { _subscribe(kSignal); }
+
+private:
+    std::string _getTaskName(void) const override { return "PubProbe"; }
     std::vector<std::pair<State, std::string_view>> _getStateNameMap(void) const override { return {}; }
     HandleResult _topInitialTrans(void) override { return HandleResult::Ignored; }
 };
@@ -166,12 +191,154 @@ int main() {
     (void)second;
     expect(fileCount(root / "SweepTask") == 1, "folder file cap deletes the oldest closed file");
 
+    uOS::LogLimits trimLim;
+    trimLim.maxFolderFiles = 2;
+    trimLim.maxFolderBytes = 1024ull * 1024ull * 1024ull * 1024ull;
+    const fs::path trimDir = root / "TrimTask";
+    std::error_code trimRm;
+    fs::remove_all(trimDir, trimRm);
+    {
+        auto oldest = uOS::Logger::openTask("TrimTask", "a", 30, trimLim);
+        uOS::Logger::detachTask(30);
+        (void)oldest;
+    }
+    {
+        auto middle = uOS::Logger::openTask("TrimTask", "b", 31, trimLim);
+        uOS::Logger::detachTask(31);
+        (void)middle;
+    }
+    {
+        auto newestTask = uOS::Logger::openTask("TrimTask", "c", 32, trimLim);
+        uOS::Logger::detachTask(32);
+        (void)newestTask;
+    }
+    expect(fileCount(trimDir) == 2, "third open drops one closed file");
+    bool sawA = false;
+    bool sawB = false;
+    bool sawC = false;
+    for (const auto& entry : fs::directory_iterator(trimDir)) {
+        const auto name = entry.path().filename().string();
+        sawA = sawA || name.ends_with("_a.log");
+        sawB = sawB || name.ends_with("_b.log");
+        sawC = sawC || name.ends_with("_c.log");
+    }
+    expect(!sawA && sawB && sawC, "oldest closed file is the one removed");
+
+    uOS::LogLimits keep;
+    keep.maxFolderFiles = 100000;
+    keep.maxFolderBytes = 1024ull * 1024ull * 1024ull * 1024ull;
+    const fs::path keepDir = root / "KeepTask";
+    const std::size_t keepBefore = fs::exists(keepDir) ? fileCount(keepDir) : 0;
+    {
+        auto a = uOS::Logger::openTask("KeepTask", "a", 20, keep);
+        auto b = uOS::Logger::openTask("KeepTask", "b", 21, keep);
+        auto c = uOS::Logger::openTask("KeepTask", "c", 22, keep);
+        uOS::Logger::detachTask(20);
+        uOS::Logger::detachTask(21);
+        uOS::Logger::detachTask(22);
+        (void)a;
+        (void)b;
+        (void)c;
+    }
+    expect(fileCount(keepDir) == keepBefore + 3, "closing a task log does not delete it");
+
+    // Same limits on every stream so they share one folder record. The closed
+    // files stay empty: an init line in each would push a correct trim over the
+    // byte cap and the test could no longer see a phantom rotation count.
+    uOS::LogLimits rot;
+    rot.maxFileBytes = 512;
+    rot.maxFolderFiles = 1000;
+    rot.maxFolderBytes = 51200;
+    // Same rule as backupCount(): one live chain is the active file plus this many backups.
+    const std::uintmax_t segment = rot.maxFileBytes < 512 ? 512 : rot.maxFileBytes;
+    std::uintmax_t byBytes = segment == 0 ? 1 : rot.maxFolderBytes / segment;
+    if (byBytes == 0) {
+        byBytes = 1;
+    }
+    const std::uintmax_t byFiles = rot.maxFolderFiles == 0 ? 1 : rot.maxFolderFiles;
+    std::uintmax_t backups = byBytes < byFiles ? byBytes : byFiles;
+    if (backups < 1) {
+        backups = 1;
+    }
+    constexpr int kClosedLogs = 30;
+    constexpr int kRotateWrites = 250;
+    const std::size_t steadyFiles = static_cast<std::size_t>(kClosedLogs) + static_cast<std::size_t>(backups) + 1;
+    const fs::path rotDir = root / "RotateTask";
+    std::error_code rotRm;
+    fs::remove_all(rotDir, rotRm);
+    for (int i = 0; i < kClosedLogs; ++i) {
+        const auto id = static_cast<uOS::TaskId>(100 + i);
+        auto closed = uOS::Logger::openTask("RotateTask", "c" + std::to_string(i), id, rot);
+        uOS::Logger::detachTask(id);
+        (void)closed;
+    }
+    {
+        auto live = uOS::Logger::openTask("RotateTask", "live", 200, rot);
+        const std::string blob(400, 'y');
+        // Each line is one segment. The loop has to pass backupCount or the file
+        // count never reaches the steady chain and a missing backup delete stays hidden.
+        for (int n = 0; n < kRotateWrites; ++n) {
+            LOG_TO(live, uOS::LogLevel::LOG_INFO, "{}", blob);
+            live.flush();
+        }
+        std::size_t totalFiles = 0;
+        std::uintmax_t totalBytes = 0;
+        int closedBases = 0;
+        for (const auto& entry : fs::directory_iterator(rotDir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            ++totalFiles;
+            totalBytes += entry.file_size();
+            const auto name = entry.path().filename().string();
+            const auto dot = name.rfind('.');
+            if (dot == std::string::npos || name.substr(dot) != ".log") {
+                continue;
+            }
+            const auto stem = name.substr(0, dot);
+            const auto mark = stem.rfind("_c");
+            if (mark == std::string::npos || mark + 2 >= stem.size()) {
+                continue;
+            }
+            bool digits = true;
+            for (std::size_t i = mark + 2; i < stem.size(); ++i) {
+                if (stem[i] < '0' || stem[i] > '9') {
+                    digits = false;
+                    break;
+                }
+            }
+            if (digits) {
+                ++closedBases;
+            }
+        }
+        if (closedBases != kClosedLogs || totalFiles != steadyFiles || totalBytes > rot.maxFolderBytes) {
+            std::cerr << "rotate files=" << totalFiles << " steady=" << steadyFiles << " bytes=" << totalBytes << " closed=" << closedBases
+                      << "\n";
+        }
+        expect(closedBases == kClosedLogs, "rotation leaves the other closed logs");
+        expect(totalFiles == steadyFiles, "rotation holds the closed logs plus the full backup chain");
+        expect(totalBytes <= rot.maxFolderBytes, "rotation stays within the byte cap");
+        uOS::Logger::detachTask(200);
+        (void)live;
+    }
+
     const uOS::TaskId namedId = uOS::FW::createTask<NamedTask>("n1");
     uOS::FW::deleteTask(namedId);
     const fs::path named = newest(root / "NamedTask");
     expect(!named.empty(), "createTask opens a folder from _getTaskName");
     expect(contains(named, "Instance n1 is initialized"), "init line uses the instance name");
     expect(contains(named, "NamedTask/n1"), "logger name uses the virtual type name");
+
+    const uOS::TaskId probeId = uOS::FW::createTask<PubProbe>("p1");
+    uOS::FW::deleteTask(probeId);
+    uOS::FW::publishEvent(uOS::new_e(PubProbe::kSignal));
+    uOS::systemLog().flush();
+    const int missingWarnings = capturedCount("not found on publishing");
+    expect(missingWarnings == 1, "publish to a missing task warns while running");
+    uOS::FW::kill();
+    uOS::FW::publishEvent(uOS::new_e(PubProbe::kSignal));
+    uOS::systemLog().flush();
+    expect(capturedCount("not found on publishing") == missingWarnings, "publish after kill does not warn");
 
     uOS::Logger::stop();
 

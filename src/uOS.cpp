@@ -342,6 +342,8 @@ int32_t FW::run() {
     } // map is empty: _findTask() now returns nullptr
 
     // Graveyard destructors may postEvent. The map is already empty, so that misses.
+    // Skip per-task logger removal. Logger::stop() flushes the backend once.
+    Logger::beginFrameworkShutdown();
     _retireTasks(std::move(dyingHeld));
     dyingTasks.clear(); // NsaUeTask::~NsaUeTask may postEvent; that is now a no-op
 
@@ -595,6 +597,9 @@ TimerId FW::postEventEvery(uint_fast16_t intervalMs, TaskId taskId, std::shared_
 }
 
 void FW::publishEvent(std::shared_ptr<const Event> event) {
+    if (!_isRunning) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(_subsMutex);
 
     // get signal's subs list, return if signal id does not have subs list
@@ -756,6 +761,9 @@ void FW::registerCliMenu(TaskId taskId, std::unique_ptr<cli::Menu>&& menuPtr) {
 //////////////////////////////////////////////////////
 
 void FW::_publishEvent(std::shared_ptr<const Event>&& event) {
+    if (!_isRunning) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(_subsMutex);
 
     // get signal's subs list, return if signal id does not have subs list

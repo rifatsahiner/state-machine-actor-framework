@@ -32,6 +32,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -40,6 +41,7 @@
 #include <mutex>
 #include <poll.h>
 #include <pthread.h>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -69,6 +71,89 @@ bool g_teeOn = false;
 
 std::mutex g_liveMu;
 std::unordered_set<std::string> g_live;
+
+// One record per log folder. Totals, the closed-file list, and each live stream's
+// backup sizes move together. Quill deletes the oldest backup with no callback, so
+// a rotation is committed in after_open, after that delete, not in after_close.
+struct ClosedWhen {
+    std::filesystem::file_time_type when{};
+    std::string path;
+
+    bool operator<(const ClosedWhen& rhs) const {
+        if (when != rhs.when) {
+            return when < rhs.when;
+        }
+        return path < rhs.path;
+    }
+};
+
+struct ClosedBucket {
+    std::set<ClosedWhen> order;
+    std::unordered_map<std::string, std::pair<std::uintmax_t, std::filesystem::file_time_type>> info;
+
+    void clear() {
+        order.clear();
+        info.clear();
+    }
+
+    bool empty() const { return order.empty(); }
+
+    void add(const std::string& path, std::uintmax_t bytes, std::filesystem::file_time_type when) {
+        drop(path);
+        order.insert(ClosedWhen{when, path});
+        info.emplace(path, std::make_pair(bytes, when));
+    }
+
+    void drop(const std::string& path) {
+        auto it = info.find(path);
+        if (it == info.end()) {
+            return;
+        }
+        order.erase(ClosedWhen{it->second.second, path});
+        info.erase(it);
+    }
+
+    std::pair<std::string, std::uintmax_t> popOldest() {
+        const ClosedWhen oldest = *order.begin();
+        const auto bytes = info.find(oldest.path)->second.first;
+        order.erase(order.begin());
+        info.erase(oldest.path);
+        return {oldest.path, bytes};
+    }
+};
+
+// `backups` is oldest first. `accounted` is the active file's size already in `bytes`.
+// `pendingClose` is the size after_close saw and after_open has not committed yet.
+struct StreamAccount {
+    std::uintmax_t accounted = 0;
+    std::deque<std::uintmax_t> backups;
+    std::uintmax_t pendingClose = 0;
+    bool closePending = false;
+    uint32_t backupLimit = 0;
+};
+
+struct FolderRecord {
+    std::size_t files = 0;
+    std::uintmax_t bytes = 0;
+    bool known = false;
+    bool dry = false;
+    ClosedBucket closed;
+    std::unordered_set<std::string> counted;
+    std::unordered_map<std::string, StreamAccount> streams;
+};
+
+std::unordered_map<std::string, FolderRecord> g_folders;
+// Set before bulk task destruction. Close callbacks and ~Impl must not walk a
+// folder, or remove one logger, per task on the way out.
+std::atomic<bool> g_frameworkShutdown{false};
+
+uint32_t backupCount(const uOS::LogLimits& limits);
+
+// Quill's index name is parent/stem.N.ext. Index 1 is the newest backup.
+std::filesystem::path indexedBackup(const std::filesystem::path& active, uint32_t index) {
+    const std::string stem = (active.parent_path() / active.stem()).string();
+    return std::filesystem::path{stem + "." + std::to_string(index) + active.extension().string()};
+}
 
 std::mutex g_captureMu;
 std::vector<std::string> g_capture;
@@ -118,9 +203,73 @@ void noteLive(const std::filesystem::path& path) {
     g_live.insert(path.string());
 }
 
+void applyByteDelta(FolderRecord& record, std::uintmax_t previous, std::uintmax_t now) {
+    if (now >= previous) {
+        record.bytes += now - previous;
+    } else {
+        const auto drop = previous - now;
+        record.bytes = record.bytes >= drop ? record.bytes - drop : 0;
+    }
+}
+
+// The active file is already in the file count. Commit its final size, then move
+// that path and every index segment Quill still has (stem.1.ext …) into the closed
+// set. Their bytes are already in the total unless a stat disagrees.
 void noteDead(const std::filesystem::path& path) {
     std::lock_guard lock(g_liveMu);
-    g_live.erase(path.string());
+    const std::string key = path.string();
+    g_live.erase(key);
+    if (g_frameworkShutdown.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto folder = path.parent_path();
+    auto found = g_folders.find(folder.string());
+    if (found == g_folders.end() || !found->second.known) {
+        return;
+    }
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return;
+    }
+    const auto when = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return;
+    }
+    auto& record = found->second;
+    StreamAccount stream;
+    if (auto streamIt = record.streams.find(key); streamIt != record.streams.end()) {
+        stream = std::move(streamIt->second);
+        record.streams.erase(streamIt);
+    }
+    applyByteDelta(record, stream.accounted, sz);
+    record.closed.add(key, sz, when);
+    record.counted.insert(key);
+    record.dry = false;
+
+    const uint32_t limit = stream.backupLimit;
+    const std::size_t tracked = stream.backups.size();
+    for (std::size_t index = 1; index <= limit; ++index) {
+        const auto backup = indexedBackup(path, static_cast<uint32_t>(index));
+        const std::string bkey = backup.string();
+        std::error_code bec;
+        const auto bsz = std::filesystem::file_size(backup, bec);
+        if (bec) {
+            break;
+        }
+        const auto bwhen = std::filesystem::last_write_time(backup, bec);
+        if (bec) {
+            break;
+        }
+        if (index <= tracked) {
+            applyByteDelta(record, stream.backups[tracked - index], bsz);
+            record.counted.insert(bkey);
+        } else if (record.counted.insert(bkey).second) {
+            record.bytes += bsz;
+            record.files += 1;
+        }
+        record.closed.add(bkey, bsz, bwhen);
+    }
 }
 
 bool protects(const std::filesystem::path& base, const std::filesystem::path& candidate) {
@@ -158,16 +307,29 @@ bool isProtected(const std::filesystem::path& candidate) {
     return false;
 }
 
-void sweepFolder(const std::filesystem::path& folder, const uOS::LogLimits& limits) {
-    std::lock_guard lock(g_liveMu);
+bool overCap(const FolderRecord& record, const uOS::LogLimits& limits) {
+    return record.files > limits.maxFolderFiles || record.bytes > limits.maxFolderBytes;
+}
+
+void subtractVictim(FolderRecord& record, std::uintmax_t bytes) {
+    if (record.files > 0) {
+        record.files -= 1;
+    }
+    if (record.bytes >= bytes) {
+        record.bytes -= bytes;
+    } else {
+        record.bytes = 0;
+    }
+}
+
+// Caller holds g_liveMu. One directory walk replaces the folder record. Live
+// index chains are copied into each stream's deque and are not added again.
+void adoptScan(const std::filesystem::path& folder, const uOS::LogLimits& limits) {
     std::error_code ec;
-    struct Entry {
-        std::filesystem::path path;
-        std::uintmax_t bytes;
-        std::filesystem::file_time_type when;
-    };
-    std::vector<Entry> files;
+    std::vector<std::string> files;
+    std::unordered_map<std::string, std::uintmax_t> sizes;
     std::uintmax_t total = 0;
+    FolderRecord record;
     for (const auto& dir : std::filesystem::directory_iterator(folder, ec)) {
         if (ec || !dir.is_regular_file(ec)) {
             continue;
@@ -176,36 +338,207 @@ void sweepFolder(const std::filesystem::path& folder, const uOS::LogLimits& limi
         if (ec) {
             continue;
         }
-        files.push_back(Entry{dir.path(), size, dir.last_write_time(ec)});
+        auto when = dir.last_write_time(ec);
+        if (ec) {
+            when = {};
+        }
+        const std::string key = dir.path().string();
+        files.push_back(key);
+        sizes.emplace(key, size);
         total += size;
+        if (!isProtected(dir.path())) {
+            record.closed.add(key, size, when);
+        }
     }
 
-    auto older = [](const Entry& a, const Entry& b) {
-        if (a.when != b.when) {
-            return a.when < b.when;
-        }
-        return a.path.string() < b.path.string();
-    };
-
-    while ((total > limits.maxFolderBytes || files.size() > limits.maxFolderFiles) && !files.empty()) {
-        auto victim = files.end();
-        for (auto it = files.begin(); it != files.end(); ++it) {
-            if (isProtected(it->path)) {
-                continue;
-            }
-            if (victim == files.end() || older(*it, *victim)) {
-                victim = it;
-            }
-        }
-        if (victim == files.end()) {
-            break;
-        }
+    std::size_t count = files.size();
+    std::unordered_set<std::string> gone;
+    while ((total > limits.maxFolderBytes || count > limits.maxFolderFiles) && !record.closed.empty()) {
+        const auto victim = record.closed.popOldest();
         std::error_code rm;
-        std::filesystem::remove(victim->path, rm);
-        if (!rm && total >= victim->bytes) {
-            total -= victim->bytes;
+        std::filesystem::remove(victim.first, rm);
+        if (rm && rm.value() != ENOENT) {
+            continue;
         }
-        files.erase(victim);
+        gone.insert(victim.first);
+        if (count > 0) {
+            count -= 1;
+        }
+        if (total >= victim.second) {
+            total -= victim.second;
+        } else {
+            total = 0;
+        }
+    }
+
+    record.files = count;
+    record.bytes = total;
+    record.known = true;
+    record.dry = total > limits.maxFolderBytes || count > limits.maxFolderFiles;
+    for (const auto& entry : files) {
+        if (gone.count(entry) != 0) {
+            continue;
+        }
+        record.counted.insert(entry);
+    }
+
+    const uint32_t limit = backupCount(limits);
+    for (const auto& live : g_live) {
+        const std::filesystem::path livePath(live);
+        if (livePath.parent_path() != folder || gone.count(live) != 0) {
+            continue;
+        }
+        StreamAccount stream;
+        stream.backupLimit = limit;
+        if (auto sizeIt = sizes.find(live); sizeIt != sizes.end()) {
+            stream.accounted = sizeIt->second;
+        }
+        for (uint32_t index = 1; index <= limit; ++index) {
+            const std::string bkey = indexedBackup(livePath, index).string();
+            if (gone.count(bkey) != 0) {
+                break;
+            }
+            auto sizeIt = sizes.find(bkey);
+            if (sizeIt == sizes.end()) {
+                break;
+            }
+            // Index 1 is newest. push_front leaves the oldest at the front.
+            stream.backups.push_front(sizeIt->second);
+        }
+        record.streams.emplace(live, std::move(stream));
+    }
+
+    g_folders[folder.string()] = std::move(record);
+}
+
+// Caller holds g_liveMu. Delete oldest closed files until the record fits.
+// Walk only when the closed list is empty and a previous walk could still delete.
+void trimToCap(const std::filesystem::path& folder, const uOS::LogLimits& limits) {
+    auto found = g_folders.find(folder.string());
+    if (found == g_folders.end() || !found->second.known) {
+        return;
+    }
+    auto& record = found->second;
+    while (overCap(record, limits)) {
+        if (record.closed.empty()) {
+            if (record.dry) {
+                return;
+            }
+            adoptScan(folder, limits);
+            return;
+        }
+        const auto victim = record.closed.popOldest();
+        std::error_code rm;
+        std::filesystem::remove(victim.first, rm);
+        if (rm && rm.value() != ENOENT) {
+            continue;
+        }
+        subtractVictim(record, victim.second);
+        record.counted.erase(victim.first);
+        record.streams.erase(victim.first);
+    }
+    record.dry = false;
+}
+
+// The new file is already on disk. The first open of a folder learns the real
+// totals with one walk. Later opens add one file and unlink oldest closed files
+// only when that addition crosses the cap.
+void accountNewFile(const std::filesystem::path& folder, const std::filesystem::path& path, const uOS::LogLimits& limits) {
+    std::lock_guard lock(g_liveMu);
+    auto& record = g_folders[folder.string()];
+    if (!record.known) {
+        adoptScan(folder, limits);
+        return;
+    }
+    const std::string key = path.string();
+    if (record.counted.insert(key).second) {
+        record.files += 1;
+    }
+    auto& stream = record.streams[key];
+    if (stream.backupLimit == 0) {
+        stream.backupLimit = backupCount(limits);
+    }
+    if (overCap(record, limits)) {
+        trimToCap(folder, limits);
+    }
+}
+
+// after_open runs after Quill has already deleted the oldest backup. A new
+// empty file is a successful rotation: add the segment after_close stored, and
+// drop the backup Quill removed once the chain is longer than backupCount.
+// A non-empty file is the append reopen after a failed rename. Nothing was deleted.
+void noteRotated(const std::filesystem::path& folder, const std::filesystem::path& path, const uOS::LogLimits& limits) {
+    if (g_frameworkShutdown.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard lock(g_liveMu);
+    if (g_frameworkShutdown.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto found = g_folders.find(folder.string());
+    if (found == g_folders.end() || !found->second.known) {
+        adoptScan(folder, limits);
+        return;
+    }
+    std::error_code ec;
+    const auto opened = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return;
+    }
+    auto& record = found->second;
+    auto streamIt = record.streams.find(path.string());
+    if (streamIt == record.streams.end() || !streamIt->second.closePending) {
+        return;
+    }
+    auto& stream = streamIt->second;
+    if (opened != 0) {
+        stream.closePending = false;
+        return;
+    }
+    const auto pending = stream.pendingClose;
+    applyByteDelta(record, stream.accounted, pending);
+    stream.backups.push_back(pending);
+    record.files += 1;
+    stream.accounted = 0;
+    stream.pendingClose = 0;
+    stream.closePending = false;
+    if (stream.backupLimit == 0) {
+        stream.backupLimit = backupCount(limits);
+    }
+    if (stream.backups.size() > stream.backupLimit) {
+        const auto oldest = stream.backups.front();
+        stream.backups.pop_front();
+        subtractVictim(record, oldest);
+    }
+    if (overCap(record, limits)) {
+        trimToCap(folder, limits);
+    }
+}
+
+// after_close runs before Quill deletes the oldest backup. Remember the size
+// and leave the totals alone. noteRotated or noteDead commits it.
+void noteClosed(const std::filesystem::path& folder, const std::filesystem::path& path, const uOS::LogLimits& limits) {
+    if (g_frameworkShutdown.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard lock(g_liveMu);
+    if (g_frameworkShutdown.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto found = g_folders.find(folder.string());
+    if (found == g_folders.end() || !found->second.known) {
+        return;
+    }
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return;
+    }
+    auto& stream = found->second.streams[path.string()];
+    stream.pendingClose = sz;
+    stream.closePending = true;
+    if (stream.backupLimit == 0) {
+        stream.backupLimit = backupCount(limits);
     }
 }
 
@@ -717,8 +1050,6 @@ struct LogStream::Impl {
     std::shared_ptr<quill::Sink> uiSink;
     std::string typeName;
     std::filesystem::path path;
-    std::filesystem::path folder;
-    LogLimits limits{};
     std::atomic<uint8_t> fileLevel{static_cast<uint8_t>(LogLevel::LOG_INFO)};
     std::atomic<uint8_t> uiLevel{static_cast<uint8_t>(LogLevel::LOG_INFO)};
     bool system = false;
@@ -729,7 +1060,9 @@ struct LogStream::Impl {
         }
         quill::Logger* dying = logger;
         logger = nullptr;
-        if (dying && g_backendUp.load(std::memory_order_acquire)) {
+        // Process exit flushes every sink once in Logger::stop(). Waiting here
+        // would block one backend round-trip per task after the window is gone.
+        if (dying && g_backendUp.load(std::memory_order_acquire) && !g_frameworkShutdown.load(std::memory_order_acquire)) {
             try {
                 if (dying->is_valid_logger()) {
                     quill::Frontend::remove_logger_blocking(dying, 0);
@@ -741,7 +1074,6 @@ struct LogStream::Impl {
         uiSink.reset();
         if (!path.empty()) {
             noteDead(path);
-            sweepFolder(folder, limits);
         }
     }
 };
@@ -764,13 +1096,23 @@ LogStream Logger::makeStream(const std::filesystem::path& folder, const std::fil
                              uint16_t viewId, LogLimits limits, bool system, TaskId id) {
     (void)viewId;
     ASSERT_FOR_FATAL(ensureWritableDir(folder));
+    // The sink constructor opens the file and runs after_open on this thread.
+    // That first open is counted by accountNewFile below. A later after_open is
+    // a rotation: the full segment was renamed aside and the active path is new.
+    auto opened = std::make_shared<std::atomic<bool>>(false);
     quill::FileEventNotifier notifier;
-    notifier.after_close = [folder, limits](const std::filesystem::path&) { sweepFolder(folder, limits); };
+    notifier.after_open = [opened, folder, limits](const std::filesystem::path& openedPath, quill::FileEventNotifierHandle) {
+        if (!opened->exchange(true)) {
+            return;
+        }
+        noteRotated(folder, openedPath, limits);
+    };
+    notifier.after_close = [folder, limits](const std::filesystem::path& closedPath) { noteClosed(folder, closedPath, limits); };
 
     auto fileSink = quill::Frontend::create_or_get_sink<quill::RotatingFileSink>(path.string(), rotatingConfig(limits), std::move(notifier));
     fileSink->set_log_level_filter(toQuill(uOS::LogLevel::LOG_INFO));
     noteLive(path);
-    sweepFolder(folder, limits);
+    accountNewFile(folder, path, limits);
 
     std::shared_ptr<quill::Sink> uiSink;
     if (g_tuiOn) {
@@ -815,8 +1157,6 @@ LogStream Logger::makeStream(const std::filesystem::path& folder, const std::fil
     impl->uiSink = std::move(uiSink);
     impl->typeName = std::move(typeName);
     impl->path = path;
-    impl->folder = folder;
-    impl->limits = limits;
     impl->system = system;
     return LogStream{std::move(impl)};
 }
@@ -989,6 +1329,8 @@ void Logger::start(void) {
     }
 #endif
 }
+
+void Logger::beginFrameworkShutdown() { g_frameworkShutdown.store(true, std::memory_order_release); }
 
 void Logger::stop(void) {
     // Flush while the widget and the backend are both still alive.

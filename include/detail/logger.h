@@ -26,6 +26,10 @@ public:
     static void init(int argc, char* argv[], const std::string& appName = "uOS", std::optional<std::function<void(void)>> quitCb = std::nullopt);
     static void start(void);
     static void stop(void);
+    // Call after the run loop has stopped accepting work and before task
+    // destructors run. Process exit then flushes in Logger::stop() instead of
+    // waiting on one logger removal per task. Mid-run deleteTask still waits.
+    static void beginFrameworkShutdown();
 
     static LogStream openTask(std::string_view actorName, std::string_view instName, TaskId id, LogLimits limits = {});
     static void detachTask(TaskId id);
